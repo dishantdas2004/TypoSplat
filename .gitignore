@@ -1,0 +1,5 @@
+typo3d/
+__pycache__/
+*.pyc
+.DS_Store
+external/
