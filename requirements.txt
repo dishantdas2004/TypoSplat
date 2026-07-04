@@ -4,3 +4,8 @@ gsplat
 transformers
 timm
 einops
+openexr
+plyfile
+matplotlib
+pillow
+numpy
