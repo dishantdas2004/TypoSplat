@@ -40,8 +40,8 @@ def get_letter_mask(ply_path, meta_json, device='cpu', target_size=(148, 148), o
     flip_yz = torch.tensor([[1., 0., 0.], 
                             [0., -1., 0.], 
                             [0., 0., -1.]], device=device)
-    R_cv = R_b @ flip_yz
-    T_cv = T_b @ flip_yz
+    R_cv = flip_yz @ R_b
+    T_cv = flip_yz @ T_b
     
     # PyTorch3D expects batched inputs
     R_cv = R_cv.unsqueeze(0) # [1, 3, 3]

@@ -41,8 +41,8 @@ def main():
     
     # Upsample it purely for visual overlay with the 518x518 RGB image
     mask_148_upscaled = torch.nn.functional.interpolate(
-        mask_148_tensor.unsqueeze(0), size=(518, 518), mode='nearest'
-    )[0, 0, 0].cpu().numpy()
+        mask_148_tensor, size=(518, 518), mode='nearest'
+    )[0, 0].cpu().numpy()
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
@@ -54,12 +54,13 @@ def main():
     axes[1].set_title("Downsampled Letter Mask (148x148)")
     axes[1].axis('off')
 
-    # Create a red overlay
-    overlay = np.zeros_like(img_np)
-    overlay[:, :, 0] = 255 # Red channel
+    # Create a bulletproof RGBA float overlay
+    overlay = np.zeros((*mask_148_upscaled.shape, 4), dtype=np.float32)
+    overlay[..., 0] = 1.0 # Red channel
+    overlay[..., 3] = mask_148_upscaled * 0.5 # Alpha channel driven by the float mask
     
     axes[2].imshow(img_np)
-    axes[2].imshow(overlay, alpha=mask_148_upscaled * 0.5)
+    axes[2].imshow(overlay)
     axes[2].set_title("Mask Overlay (Should perfectly hug text)")
     axes[2].axis('off')
 
