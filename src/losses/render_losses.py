@@ -14,10 +14,16 @@ def _check_shape(tensor, name="Tensor"):
     assert tensor.dim() == 4, f"{name} must be 4D, got {tensor.shape}"
     assert tensor.shape[1] == 3, f"{name} must be channel-first [B, 3, H, W], got {tensor.shape}. Did you forget to permute(0, 3, 1, 2)?"
 
-def compute_l1_rgb_loss(pred_rgb, gt_rgb):
-    """Standard L1 pixel-wise loss."""
+def compute_l1_rgb_loss(pred_rgb, gt_rgb, mask=None):
+    """Standard L1 pixel-wise loss, with optional spatial masking."""
     _check_shape(pred_rgb, "pred_rgb")
     _check_shape(gt_rgb, "gt_rgb")
+    
+    if mask is not None:
+        assert mask.shape[2:] == pred_rgb.shape[2:], f"Mask shape {mask.shape} doesn't match image {pred_rgb.shape}"
+        abs_err = torch.abs(pred_rgb - gt_rgb) * mask
+        return abs_err.sum() / (mask.sum() + 1e-6)
+        
     return F.l1_loss(pred_rgb, gt_rgb)
 
 def compute_sobel_edge_loss(pred_rgb, gt_rgb, mask=None):
@@ -53,11 +59,9 @@ def compute_sobel_edge_loss(pred_rgb, gt_rgb, mask=None):
     # 5. Masking
     if mask is not None:
         assert mask.shape[2:] == pred_rgb.shape[2:], f"Mask shape {mask.shape} doesn't match image {pred_rgb.shape}"
-        pred_mag = pred_mag * mask
-        gt_mag = gt_mag * mask
-        # Average only over the valid masked pixels to prevent dilution
-        valid_pixels = mask.sum() + 1e-6
-        return F.l1_loss(pred_mag, gt_mag, reduction='sum') / valid_pixels
+        # FIX: Compute the absolute difference BEFORE masking
+        abs_err = torch.abs(pred_mag - gt_mag) * mask
+        return abs_err.sum() / (mask.sum() + 1e-6)
         
     return F.l1_loss(pred_mag, gt_mag)
 
@@ -83,7 +87,7 @@ class ShallowPerceptualLoss(torch.nn.Module):
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
 
-    def forward(self, pred, gt):
+    def forward(self, pred, gt, mask=None):
         _check_shape(pred, "pred_rgb")
         _check_shape(gt, "gt_rgb")
         
@@ -92,5 +96,11 @@ class ShallowPerceptualLoss(torch.nn.Module):
         
         pred_feat = self.vgg_slice(pred_norm)
         gt_feat = self.vgg_slice(gt_norm)
+        
+        if mask is not None:
+            # Mask in feature space to avoid generating artificial edges that VGG will detect
+            mask_feat = F.interpolate(mask, size=pred_feat.shape[-2:], mode='nearest')
+            abs_err = torch.abs(pred_feat - gt_feat) * mask_feat
+            return abs_err.sum() / (mask_feat.sum() + 1e-6)
         
         return F.l1_loss(pred_feat, gt_feat)
