@@ -154,7 +154,7 @@ def main():
     ]], dtype=torch.float32, device=device)
     viewmats = torch.eye(4, device=device).unsqueeze(0)
 
-    iterations = 250 
+    iterations = 5000 
     loss_history = []
     
     print("\nStarting Training Loop...")
@@ -187,28 +187,42 @@ def main():
         pred_rgb = render_colors.permute(0, 3, 1, 2)
         
         # --- Compute Losses (Strictly Aligned Scope) ---
-        # Image-space losses now receive mask_518
         loss_rgb = compute_l1_rgb_loss(pred_rgb, gt_rgb, mask=mask_518)
         loss_edge = compute_sobel_edge_loss(pred_rgb, gt_rgb, mask=mask_518)
         loss_lpips = lpips_fn(pred_rgb, gt_rgb, mask=mask_518)
         
-        # Depth is now Scale-Invariant, evaluated on Layer 1 (Front of the extrusion)
         layer_1_depth = params_0["true_depth"] + params_1["z_offset"]
         loss_depth = compute_scale_invariant_depth_loss(layer_1_depth, gt_depth_148, mask_148.bool())
         
-        # Extrusion handles relative thickness of the layers
         loss_extrusion = compute_extrusion_loss(params_1, params_2, target_extrusion=meta["extrusion_depth"], letter_mask_148=mask_148)
         
-        # Total Unweighted Loss
-        total_loss = loss_rgb + loss_edge + loss_lpips + loss_depth + loss_extrusion
+        # Balanced Loss Scales (Targeting ~1.0 baseline per active term)
+        lambda_rgb = 1.0
+        lambda_edge = 1.0
+        lambda_lpips = 0.002
+        lambda_depth = 50.0
+        lambda_extrusion = 1000.0
+        
+        total_loss = (
+            lambda_rgb * loss_rgb + 
+            lambda_edge * loss_edge + 
+            lambda_lpips * loss_lpips + 
+            lambda_depth * loss_depth + 
+            lambda_extrusion * loss_extrusion
+        )
         
         total_loss.backward()
         optimizer.step()
         
         loss_history.append(total_loss.item())
         
-        if (i+1) % 50 == 0:
-            print(f"Iter {i+1:03d} | Loss: {total_loss.item():.4f} (RGB: {loss_rgb.item():.4f}, Edge: {loss_edge.item():.4f}, LPIPS: {loss_lpips.item():.4f}, Depth: {loss_depth.item():.4f}, Extrusion: {loss_extrusion.item():.8f})")
+        if (i+1) % 500 == 0:
+            print(f"Iter {i+1:04d} | Total Balanced Loss: {total_loss.item():.4f}")
+            print(f"   > RGB:       {loss_rgb.item():.4f}")
+            print(f"   > Edge:      {loss_edge.item():.8f}")
+            print(f"   > LPIPS:     {loss_lpips.item():.4f}")
+            print(f"   > Depth:     {loss_depth.item():.4f}")
+            print(f"   > Extrusion: {loss_extrusion.item():.8f}")
             
     print("\n[SUCCESS] Stage 0 Overfit Complete!")
     print(f"Initial Loss: {loss_history[0]:.4f} -> Final Loss: {loss_history[-1]:.4f}")
@@ -229,6 +243,23 @@ def main():
     out_path = os.path.join(sample_dir, "overfit_result.png")
     plt.savefig(out_path, dpi=150)
     print(f"Saved POC render to -> {out_path}")
+
+    # --- ARTIFACT & SCALE DIAGNOSTIC ---
+    flat_mask_3x = mask_148[0, 0].float().view(-1).repeat(3)
+    max_bg_opacity = (opacities * (1 - flat_mask_3x)).max().item()
+    
+    print(f"\n--- ARTIFACT DIAGNOSTIC ---")
+    print(f"Max Opacity Outside Mask: {max_bg_opacity:.8f}")
+    if max_bg_opacity > 0.0001:
+        print("Verdict: MASKING BUG. Background Gaussians are surviving.")
+    else:
+        print("Verdict: SCALE BLEED. The opacity gate works, but edge Gaussians are too large.")
+        
+    print(f"\n--- SCALE STATS ---")
+    print(f"Mean Scale: {scales.mean().item():.6f}")
+    print(f"99th Pct:   {torch.quantile(scales, 0.99).item():.6f}")
+    print(f"Max Scale:  {scales.max().item():.6f}")
+    print(f"---------------------------\n")
 
 if __name__ == "__main__":
     main()
