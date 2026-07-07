@@ -48,7 +48,7 @@ class GaussianParameterHead(nn.Module):
         xy_offset = 3.5 * torch.tanh(xy_raw)
         z_offset = torch.exp(torch.clamp(z_raw, min=-10.0, max=6.0))
         opacity = torch.sigmoid(opacity_raw)
-        scale = torch.exp(scale_raw + self.scale_bias)
+        scale = torch.exp(torch.clamp(scale_raw + self.scale_bias, max=math.log(0.06)))
         rot = F.normalize(rot_raw, p=2, dim=1)
         
         return {
