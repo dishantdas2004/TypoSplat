@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 # Import both the normal converter and the safety helper
 from src.models.edge_predictor import depth_to_normal, _reshape_intrinsic
+from gsplat import rasterization
+from src.losses.render_losses import compute_l1_rgb_loss
 
 def compute_scale_invariant_depth_loss(pred_depth, gt_depth, valid_mask):
     """
@@ -107,3 +109,54 @@ def compute_masked_depth_loss(params_0, gt_depth_148, letter_mask_148):
         
     loss = torch.sum(abs_err * letter_mask_148.float()) / n_pixels
     return loss
+
+def compute_anisotropy_loss(scales, r_bound=10.0):
+    """
+    Penalizes Gaussians whose aspect ratio (max_scale / min_scale) exceeds r_bound.
+    """
+    scale_max = scales.max(dim=-1).values
+    scale_min = scales.min(dim=-1).values
+    aspect_ratio = scale_max / (scale_min + 1e-8)
+    penalty = torch.clamp(aspect_ratio - r_bound, min=0.0)
+    return penalty.mean()
+
+def _get_relative_viewmat(c2w_A_list, c2w_B_list, device):
+    """Helper to calculate OpenCV viewmat from Camera A to Camera B."""
+    c2w_A_blender = torch.tensor(c2w_A_list, dtype=torch.float32, device=device)
+    c2w_B_blender = torch.tensor(c2w_B_list, dtype=torch.float32, device=device)
+    
+    S = torch.tensor([
+        [1,  0,  0, 0],
+        [0, -1,  0, 0],
+        [0,  0, -1, 0],
+        [0,  0,  0, 1]
+    ], dtype=torch.float32, device=device)
+    
+    c2w_A_cv = c2w_A_blender @ S
+    c2w_B_cv = c2w_B_blender @ S
+    
+    w2c_B_cv = torch.linalg.inv(c2w_B_cv)
+    return (w2c_B_cv @ c2w_A_cv).unsqueeze(0)
+
+def compute_novel_view_loss(means, quats, scales, opacities, colors, meta_A, meta_B, gt_rgb_B, mask_518_B, device):
+    """
+    Encapsulates the Camera B relative transform, rasterization, and photometric loss.
+    Returns the loss scalar and the rendered image for visualization.
+    """
+    viewmats_B = _get_relative_viewmat(meta_A["camera_to_world_matrix"], meta_B["camera_to_world_matrix"], device)
+    
+    Ks_B = torch.tensor([[
+        [meta_B["fx"],  0, meta_B["cx"]],
+        [ 0, meta_B["fy"], meta_B["cy"]],
+        [ 0,  0,  1]
+    ]], dtype=torch.float32, device=device)
+
+    render_colors_B, _, _ = rasterization(
+        means=means, quats=quats, scales=scales, opacities=opacities, colors=colors,
+        viewmats=viewmats_B, Ks=Ks_B, width=518, height=518,
+    )
+    
+    pred_rgb_B = render_colors_B.permute(0, 3, 1, 2)
+    loss = compute_l1_rgb_loss(pred_rgb_B, gt_rgb_B, mask=mask_518_B)
+    
+    return loss, render_colors_B
