@@ -138,29 +138,27 @@ def _get_relative_viewmat(c2w_A_list, c2w_B_list, device):
     w2c_B_cv = torch.linalg.inv(c2w_B_cv)
     return (w2c_B_cv @ c2w_A_cv).unsqueeze(0)
 
-def compute_novel_view_loss(means, quats, scales, opacities, colors, meta_A, meta_B, gt_rgb_B, mask_518_B, device):
-    """
-    Encapsulates the Camera B relative transform, rasterization, and photometric loss.
-    Returns the loss scalar and the rendered image for visualization.
-    """
-    viewmats_B = _get_relative_viewmat(meta_A["camera_to_world_matrix"], meta_B["camera_to_world_matrix"], device)
+def compute_novel_view_loss(means, quats, scales, opacities, colors, viewmats_B, Ks_B, gt_rgb_B, mask_518_B, lpips_fn):
+    from gsplat import rasterization
+    from src.losses.render_losses import compute_l1_rgb_loss, compute_sobel_edge_loss
     
-    Ks_B = torch.tensor([[
-        [meta_B["fx"],  0, meta_B["cx"]],
-        [ 0, meta_B["fy"], meta_B["cy"]],
-        [ 0,  0,  1]
-    ]], dtype=torch.float32, device=device)
-
     render_colors_B, _, _ = rasterization(
         means=means, quats=quats, scales=scales, opacities=opacities, colors=colors,
         viewmats=viewmats_B, Ks=Ks_B, width=518, height=518,
     )
     
-    pred_rgb_B = render_colors_B.permute(0, 3, 1, 2)
-    loss = compute_l1_rgb_loss(pred_rgb_B, gt_rgb_B, mask=mask_518_B)
+    pred_rgb_B_raw = render_colors_B.permute(0, 3, 1, 2)
     
-    return loss, render_colors_B
-
+    # 1. Hard-gate the render for L1 and Sobel to prevent blocky 148-grid bleeding
+    pred_rgb_B_masked = pred_rgb_B_raw * mask_518_B
+    
+    loss_rgb_B = compute_l1_rgb_loss(pred_rgb_B_masked, gt_rgb_B, mask=mask_518_B)
+    loss_edge_B = compute_sobel_edge_loss(pred_rgb_B_masked, gt_rgb_B, mask=mask_518_B)
+    
+    # 2. Pass RAW unmasked render to LPIPS (VGG) to prevent artificial cutout edges
+    loss_lpips_B = lpips_fn(pred_rgb_B_raw, gt_rgb_B, mask=mask_518_B)
+    
+    return loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B
 
 def compute_centroid_loss(means, viewmats_B, K_B, mask_518_B, device):
     """
@@ -206,3 +204,10 @@ def compute_zoffset_regularization(params_1, params_2, target_per_layer=0.0562):
     reg1 = ((params_1["z_offset"] - target_per_layer) ** 2).mean()
     reg2 = ((params_2["z_offset"] - target_per_layer) ** 2).mean()
     return reg1 + reg2
+
+def compute_opacity_sparsity_loss(opacities):
+    """
+    Pushes opacities toward 0.0 or 1.0, penalizing grayish/middle values.
+    Maximum penalty is applied when opacity is exactly 0.5.
+    """
+    return (opacities * (1.0 - opacities)).mean()
