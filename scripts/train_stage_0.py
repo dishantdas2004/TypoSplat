@@ -1,6 +1,5 @@
 """
-TypoSplat Stage 0: Single-Sample Overfit Training Loop
-Incorporates Novel-View supervision to prevent degenerate flat/needle Gaussians.
+TypoSplat Stage 0: Dual-View Overfit with Depth Calibration & Centroid Bootstrap
 """
 
 import os
@@ -30,7 +29,10 @@ from src.losses.typ_losses import (
     compute_extrusion_loss, 
     compute_normal_loss, 
     compute_anisotropy_loss,
-    compute_novel_view_loss
+    compute_novel_view_loss,
+    compute_centroid_loss,
+    compute_zoffset_regularization,
+    _get_relative_viewmat
 )
 from src.data.mask_generator import get_letter_mask
 from gsplat import rasterization
@@ -53,7 +55,6 @@ def flatten_decoder_outputs_camera_space(params_0, params_1, params_2, intrinsic
     scale_factor = float(H_out) / float(H_in) 
     y_grid, x_grid = torch.meshgrid(torch.arange(H_in, device=device, dtype=torch.float32), torch.arange(H_in, device=device, dtype=torch.float32), indexing='ij')
     all_means, all_quats, all_scales, all_opacities, all_colors = [], [], [], [], []
-    
     flat_mask = mask_148[0, 0].float().view(-1) if mask_148 is not None else None
     
     for params in [params_0, params_1, params_2]:
@@ -84,7 +85,7 @@ def flatten_decoder_outputs_camera_space(params_0, params_1, params_2, intrinsic
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"=== TypoSplat: Stage 0 Training (Dual-View Overfit) ===")
+    print(f"=== TypoSplat: Stage 0 Training (Depth Calibrator + Centroid Bootstrap) ===")
     
     sample_dir = sys.argv[1] if len(sys.argv) > 1 else "/content/data/19"
     meta_path = os.path.join(sample_dir, "metadata.json")
@@ -97,18 +98,15 @@ def main():
     view_B_paths = glob.glob(os.path.join(sample_dir, "*view_B*.png"))
     depth_A_paths = glob.glob(os.path.join(sample_dir, "*depth_A*.exr"))
     
-    # Load Camera A
     gt_rgb_A = transforms.ToTensor()(Image.open(view_A_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(device)
     gt_depth_518_A = load_exr_depth(depth_A_paths[0], device)
     gt_depth_148_A = torch.nn.functional.interpolate(gt_depth_518_A, size=(148, 148), mode='nearest')
     
-    # Load Camera B
     gt_rgb_B = transforms.ToTensor()(Image.open(view_B_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(device)
     
-    print("Pre-computing letter masks for both views...")
+    print("Pre-computing letter masks...")
     mask_148_A = get_letter_mask(mesh_path, meta, device=device)
     mask_518_A = torch.nn.functional.interpolate(mask_148_A, size=(518, 518), mode='nearest')
-    
     mask_148_B = get_letter_mask(mesh_path, meta["camera_B"], device=device)
     mask_518_B = torch.nn.functional.interpolate(mask_148_B, size=(518, 518), mode='nearest')
     
@@ -123,7 +121,7 @@ def main():
     trainable_params = list(upsampler.parameters()) + list(decoder.parameters())
     optimizer = optim.Adam(trainable_params, lr=1e-4)
     
-    # Camera A Setup
+    # Setup Camera A
     intrinsics_tuple_A = (meta["fx"], meta["fy"], meta["cx"], meta["cy"])
     scale_148 = 148.0 / 518.0
     intrinsics_dict_148_A = {
@@ -132,6 +130,11 @@ def main():
     }
     Ks_A = torch.tensor([[[meta["fx"], 0, meta["cx"]], [0, meta["fy"], meta["cy"]], [0, 0, 1]]], dtype=torch.float32, device=device)
     viewmats_A = torch.eye(4, device=device).unsqueeze(0)
+
+    # Setup Camera B (Static, compute once)
+    meta_B = meta["camera_B"]
+    Ks_B = torch.tensor([[[meta_B["fx"], 0, meta_B["cx"]], [0, meta_B["fy"], meta_B["cy"]], [0, 0, 1]]], dtype=torch.float32, device=device)
+    viewmats_B = _get_relative_viewmat(meta["camera_to_world_matrix"], meta_B["camera_to_world_matrix"], device)
 
     iterations = 5000 
     loss_history = []
@@ -149,7 +152,10 @@ def main():
         optimizer.zero_grad()
         
         upsampled_features = upsampler(base_patch_tokens)
-        params_0, params_1, params_2 = decoder(upsampled_features, base_depth_518)
+        
+        # Pass patch tokens to decoder so calibrator can use them
+        params_list, calib_scale, calib_shift = decoder(upsampled_features, base_depth_518, base_patch_tokens)
+        params_0, params_1, params_2 = params_list
         
         means, quats, scales, opacities, colors = flatten_decoder_outputs_camera_space(
             params_0, params_1, params_2, intrinsics_tuple_A, device, mask_148=mask_148_A
@@ -162,7 +168,7 @@ def main():
         )
         pred_rgb_A = render_colors_A.permute(0, 3, 1, 2)
         
-        # --- Losses ---
+        # --- Core Losses ---
         loss_rgb = compute_l1_rgb_loss(pred_rgb_A, gt_rgb_A, mask=mask_518_A)
         loss_edge = compute_sobel_edge_loss(pred_rgb_A, gt_rgb_A, mask=mask_518_A)
         loss_lpips = lpips_fn(pred_rgb_A, gt_rgb_A, mask=mask_518_A)
@@ -173,16 +179,36 @@ def main():
         loss_aniso = compute_anisotropy_loss(scales, r_bound=10.0)
         loss_normal = compute_normal_loss(layer_1_depth, gt_depth_148_A, intrinsics_dict_148_A, mask_148_A)
         
-        # Novel View Loss (Encapsulates Camera B Render & L1 Calculation)
         loss_novel_view, render_colors_B = compute_novel_view_loss(
-            means, quats, scales, opacities, colors, 
-            meta, meta["camera_B"], gt_rgb_B, mask_518_B, device
+            means, quats, scales, opacities, colors, viewmats_B, Ks_B, gt_rgb_B, mask_518_B
         )
         
+        # --- NEW: Bootstrap & Regularization ---
+        loss_centroid = compute_centroid_loss(means, viewmats_B, Ks_B, mask_518_B, device)
+        loss_zreg = compute_zoffset_regularization(params_1, params_2)
+        
+        centroid_weight = max(0.0, 1.0 - i / 1500.0)
+        
         if i == 0:
-            print(f"\n--- RAW NOVEL VIEW MAGNITUDE (ITER 0) ---")
-            print(f"Raw Novel View: {loss_novel_view.item():.4f}")
+            print(f"\n--- RAW MAGNITUDES (ITER 0) ---")
+            print(f"Raw Centroid Loss: {loss_centroid.item():.4f}")
+            print(f"Raw Z-Reg Loss:    {loss_zreg.item():.6f}")
+            print(f"Use these to tune lambda_centroid!")
+            print(f"-------------------------------\n")
             sys.exit(0) # STOP EXECUTION TO TUNE LAMBDA
+        
+        # Balanced Loss Scales
+        lambda_rgb = 1.0
+        lambda_edge = 1.0
+        lambda_lpips = 0.002
+        lambda_depth = 50.0
+        lambda_extrusion = 1000.0
+        lambda_aniso = 1.0  
+        lambda_normal = 1.0 
+        lambda_novel_view = 0.5
+        
+        # TODO: Update this after looking at Iter 0 printout!
+        lambda_centroid = 1.0
         
         total_loss = (
             1.0 * loss_rgb + 
@@ -192,16 +218,40 @@ def main():
             1000.0 * loss_extrusion +
             1.0 * loss_aniso + 
             1.0 * loss_normal +
-            1.0 * loss_novel_view # Adjust this after checking Iter 0
+            lambda_novel_view * loss_novel_view +
+            centroid_weight * lambda_centroid * loss_centroid +
+            0.05 * loss_zreg
         )
         
         total_loss.backward()
         optimizer.step()
         loss_history.append(total_loss.item())
         
+        # --- 500-Iteration Heavy Diagnostic Log ---
         if (i+1) % 500 == 0:
-            print(f"Iter {i+1:04d} | Total: {total_loss.item():.4f} | Aniso: {loss_aniso.item():.4f} | Novel View: {loss_novel_view.item():.4f}")
+            # 1. Off-screen calculation
+            with torch.no_grad():
+                means_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)
+                points_camB = (viewmats_B[0] @ means_h.T).T
+                x_proj = (points_camB[:, 0] / points_camB[:, 2]) * Ks_B[0,0,0] + Ks_B[0,0,2]
+                y_proj = (points_camB[:, 1] / points_camB[:, 2]) * Ks_B[0,1,1] + Ks_B[0,1,2]
+                out_of_bounds = (x_proj < 0) | (x_proj > 518) | (y_proj < 0) | (y_proj > 518) | (points_camB[:, 2] <= 0)
+                frac_offscreen = out_of_bounds.float().mean().item()
             
+            # 2. Novel View Gradient tracking
+            nv_grad = torch.autograd.grad(loss_novel_view, means, retain_graph=True, allow_unused=True)[0]
+            nv_grad_mag = nv_grad.abs().mean().item() if nv_grad is not None else 0.0
+            
+            print(f"\nIter {i+1:04d} | Total: {total_loss.item():.4f}")
+            print(f"   > RGB: {loss_rgb.item():.4f} | Edge: {loss_edge.item():.4f} | LPIPS: {loss_lpips.item():.4f}")
+            print(f"   > Depth: {loss_depth.item():.4f} | Novel View: {loss_novel_view.item():.4f} | Centroid: {loss_centroid.item():.4f}")
+            print(f"   > NV Grad Mag: {nv_grad_mag:.10f} | Off-screen B: {frac_offscreen:.2%}")
+            print(f"   > Calibrator -> Scale: {calib_scale[0,0].item():.4f}, Shift: {calib_shift[0,0].item():.4f}")
+            print("-" * 50)
+            
+    print("\n[SUCCESS] Stage 0 Overfit Complete!")
+    print(f"Initial Loss: {loss_history[0]:.4f} -> Final Loss: {loss_history[-1]:.4f}")
+    
     # Save a comparison render showing both views
     fig, axes = plt.subplots(2, 2, figsize=(10, 10))
     axes[0,0].imshow(gt_rgb_A[0].permute(1, 2, 0).cpu().numpy() * mask_518_A[0].permute(1, 2, 0).cpu().numpy())
@@ -216,15 +266,6 @@ def main():
     
     out_path = os.path.join(sample_dir, "overfit_result_dual.png")
     plt.savefig(out_path, dpi=150)
-
-    # --- DIAGNOSTICS ---
-    scale_max = scales.max(dim=-1).values
-    scale_min = scales.min(dim=-1).values
-    aspect_ratios = scale_max / (scale_min + 1e-8)
-    
-    print(f"\n--- ANISOTROPY (ASPECT RATIO) ---")
-    print(f"Mean Ratio: {aspect_ratios.mean().item():.2f}")
-    print(f"Max Ratio:  {aspect_ratios.max().item():.2f}")
 
 if __name__ == "__main__":
     main()

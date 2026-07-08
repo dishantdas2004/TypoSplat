@@ -15,6 +15,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class DepthCalibrator(nn.Module):
+    """
+    Predicts a per-sample (scale, shift) correction for VGGT's depth, since
+    VGGT normalizes depth per-scene (not true metric scale) — a single
+    dataset-wide constant would not generalize across samples with
+    different scene geometry.
+    """
+    def __init__(self, feature_dim=2048):
+        super().__init__()
+        self.fc = nn.Linear(feature_dim, 2)
+        # Zero-init both weight and bias -> exact identity at iteration 0
+        # (scale=1.0, shift=0.0), so this starts harmless and only
+        # learns a correction as training provides evidence for one.
+        nn.init.zeros_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, patch_tokens):
+        # patch_tokens: [B, 2048, 37, 37] from VGGTWrapper.forward_with_features()
+        pooled = patch_tokens.mean(dim=[2, 3])  # global average pool -> [B, 2048]
+        out = self.fc(pooled)
+        scale = 1.0 + out[:, 0:1]
+        shift = out[:, 1:2]
+        return scale, shift
+    
+
 class GaussianParameterHead(nn.Module):
     def __init__(self, in_channels, scale_bias=-5.0, target_total_extrusion=0.1124): 
         super().__init__()
@@ -82,11 +107,15 @@ class TypoSplatDecoder(nn.Module):
             nn.GELU()
         )
         self.head_2 = GaussianParameterHead(trunk_channels)
+        
+        # NEW: Global depth calibration to pull Gaussians into metric space
+        self.calibrator = DepthCalibrator(feature_dim=2048)
 
-    def forward(self, features, base_depth_518):
+    def forward(self, features, base_depth_518, patch_tokens):
         """
         features: [B, 258, 148, 148] from TypoSplatUpsampler
         base_depth_518: [B, 1, 518, 518] frozen VGGT base depth
+        patch_tokens: [B, 2048, 37, 37] from VGGTWrapper
         """
         # 1. Feature Extraction
         feat_0_1 = self.trunk_0_1(features)
@@ -105,12 +134,20 @@ class TypoSplatDecoder(nn.Module):
             align_corners=False
         )
         
-        # 4. Enforce Cumulative Depth Offsets (Z-Ordering) in pure 4D math to bypass MPS limits
+        # NEW 4: Compute and apply global scale/shift to correct VGGT's metric scale
+        scale, shift = self.calibrator(patch_tokens)
+        scale_view = scale.view(-1, 1, 1, 1)
+        shift_view = shift.view(-1, 1, 1, 1)
+        
+        base_depth_148 = scale_view * base_depth_148 + shift_view
+        
+        # 5. Enforce Cumulative Depth Offsets (Z-Ordering) in pure 4D math to bypass MPS limits
         params_0["true_depth"] = base_depth_148
         params_1["true_depth"] = base_depth_148 + params_1["z_offset"]
         params_2["true_depth"] = base_depth_148 + params_1["z_offset"] + params_2["z_offset"]
         
-        return [params_0, params_1, params_2]
+        # Return parameters along with scale and shift so they can be logged in the training loop
+        return [params_0, params_1, params_2], scale, shift
 
 if __name__ == "__main__":
     """

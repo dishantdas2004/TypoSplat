@@ -160,3 +160,49 @@ def compute_novel_view_loss(means, quats, scales, opacities, colors, meta_A, met
     loss = compute_l1_rgb_loss(pred_rgb_B, gt_rgb_B, mask=mask_518_B)
     
     return loss, render_colors_B
+
+
+def compute_centroid_loss(means, viewmats_B, K_B, mask_518_B, device):
+    """
+    Bypasses gsplat's rasterizer entirely (plain matrix projection), so it
+    can provide gradient even when Gaussians are fully off-screen and
+    therefore invisible/zero-gradient to the photometric novel-view loss.
+    Purely a bootstrap signal — pulls the coarse centroid of predicted
+    Gaussians toward the real letter centroid in Camera B's frame.
+    """
+    means_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)
+    cam_coords = (viewmats_B[0] @ means_h.T).T[:, :3]
+    
+    valid = cam_coords[:, 2] > 0
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+        
+    z = cam_coords[valid, 2:3]
+    xy = cam_coords[valid, :2]
+    
+    fx, fy = K_B[0, 0, 0], K_B[0, 1, 1]
+    cx, cy = K_B[0, 0, 2], K_B[0, 1, 2]
+    
+    u = (fx * xy[:, 0:1] / z) + cx
+    v = (fy * xy[:, 1:2] / z) + cy
+    
+    pred_centroid = torch.cat([u, v], dim=1).mean(dim=0)
+    
+    target_px = torch.nonzero(mask_518_B.squeeze(), as_tuple=False).float()
+    # mask indices are (row,col)=(y,x); flip to (x,y) to match pred_centroid ordering
+    target_centroid = target_px.mean(dim=0).flip(0)  
+    
+    return torch.nn.functional.l1_loss(pred_centroid, target_centroid)
+
+def compute_zoffset_regularization(params_1, params_2, target_per_layer=0.0562):
+    """
+    compute_extrusion_loss only constrains z_offset_1 + z_offset_2 (the sum).
+    Nothing stops the network satisfying that sum while putting all the
+    correction into one offset and collapsing/inverting the other, breaking
+    the physical Layer1/Layer2 separation. This is a gentle prior (not a
+    hard constraint) pulling each offset individually toward its expected
+    share of the real mean extrusion depth (0.1124 / 2 = 0.0562).
+    """
+    reg1 = ((params_1["z_offset"] - target_per_layer) ** 2).mean()
+    reg2 = ((params_2["z_offset"] - target_per_layer) ** 2).mean()
+    return reg1 + reg2
