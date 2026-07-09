@@ -33,11 +33,13 @@ class DepthCalibrator(nn.Module):
 
     def forward(self, patch_tokens):
         # patch_tokens: [B, 2048, 37, 37] from VGGTWrapper.forward_with_features()
-        pooled = patch_tokens.mean(dim=[2, 3])  # global average pool -> [B, 2048]
+        pooled = patch_tokens.mean(dim=[2, 3])  
         out = self.fc(pooled)
         scale = 1.0 + out[:, 0:1]
         shift = out[:, 1:2]
-        return scale, shift
+        
+        # --- NEW: Return raw 'out' for L2 regularization ---
+        return scale, shift, out
     
 
 class GaussianParameterHead(nn.Module):
@@ -134,20 +136,19 @@ class TypoSplatDecoder(nn.Module):
             align_corners=False
         )
         
-        # NEW 4: Compute and apply global scale/shift to correct VGGT's metric scale
-        scale, shift = self.calibrator(patch_tokens)
+        # --- NEW: Catch the raw output ---
+        scale, shift, raw_calib_out = self.calibrator(patch_tokens)
         scale_view = scale.view(-1, 1, 1, 1)
         shift_view = shift.view(-1, 1, 1, 1)
         
         base_depth_148 = scale_view * base_depth_148 + shift_view
         
-        # 5. Enforce Cumulative Depth Offsets (Z-Ordering) in pure 4D math to bypass MPS limits
         params_0["true_depth"] = base_depth_148
         params_1["true_depth"] = base_depth_148 + params_1["z_offset"]
         params_2["true_depth"] = base_depth_148 + params_1["z_offset"] + params_2["z_offset"]
         
-        # Return parameters along with scale and shift so they can be logged in the training loop
-        return [params_0, params_1, params_2], scale, shift
+        # --- NEW: Return the raw output ---
+        return [params_0, params_1, params_2], scale, shift, raw_calib_out
 
 if __name__ == "__main__":
     """

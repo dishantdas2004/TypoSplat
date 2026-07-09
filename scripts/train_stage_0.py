@@ -159,10 +159,15 @@ def main():
     decoder = TypoSplatDecoder(in_channels=258).to(device)
     lpips_fn = ShallowPerceptualLoss(device)
     
-    trainable_params = list(upsampler.parameters()) + list(decoder.parameters())
-    optimizer = optim.Adam(trainable_params, lr=1e-4)
+    # --- Split Optimizer Groups (Calibrator gets 10x slower LR) ---
+    calibrator_params = list(decoder.calibrator.parameters())
+    base_params = list(upsampler.parameters()) + [p for n, p in decoder.named_parameters() if 'calibrator' not in n]
+    
+    optimizer = optim.Adam([
+        {'params': base_params, 'lr': 1e-4},
+        {'params': calibrator_params, 'lr': 1e-5}
+    ])
 
-    # Short 2000 iteration test for convergence check
     iterations = 2000 
     batch_size = len(dataset)
     
@@ -179,7 +184,8 @@ def main():
         for data in dataset:
             upsampled_features = upsampler(data["patch_tokens"])
             
-            params_list, calib_scale, calib_shift = decoder(upsampled_features, data["base_depth"], data["patch_tokens"])
+            # --- Unpack raw_calib_out for L2 Regularization ---
+            params_list, calib_scale, calib_shift, raw_calib_out = decoder(upsampled_features, data["base_depth"], data["patch_tokens"])
             params_0, params_1, params_2 = params_list
             
             means, quats, scales, opacities, colors = flatten_decoder_outputs_camera_space(
@@ -205,7 +211,7 @@ def main():
             loss_aniso = compute_anisotropy_loss(scales, r_bound=10.0)
             loss_normal = compute_normal_loss(layer_1_depth, data["gt_depth_148_A"], data["intrinsics_dict_148_A"], data["mask_148_A"])
             
-            # --- Novel View Photometric Suite ---
+            # --- Symmetric Novel View Photometric Suite ---
             loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B = compute_novel_view_loss(
                 means, quats, scales, opacities, colors, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], lpips_fn
             )
@@ -216,9 +222,12 @@ def main():
             loss_zreg = compute_zoffset_regularization(params_1, params_2)
             loss_opacity_sparsity = compute_opacity_sparsity_loss(opacities)
             
+            # --- Soft L2 Regularization on raw calibrator output ---
+            loss_calib_reg = (raw_calib_out ** 2).mean()
+            
             centroid_weight = max(0.0, 1.0 - i / 1500.0)
             
-            # --- FIXED: Print raw magnitudes on Iter 0 for ALL samples ---
+            # --- Print raw magnitudes on Iter 0 for ALL samples ---
             if i == 0:
                 sample_name = os.path.basename(data["dir"])
                 print(f"\n--- CAMERA B RAW MAGNITUDES: Sample {sample_name} (ITER 0) ---")
@@ -244,13 +253,16 @@ def main():
                 0.5 * loss_novel_view +
                 centroid_weight * 0.05 * loss_centroid +
                 0.05 * loss_zreg +
-                1.0 * loss_opacity_sparsity
+                1.0 * loss_opacity_sparsity +
+                0.01 * loss_calib_reg  # Added Calibrator L2 Penalty
             )
             
+            # Accumulate gradient safely
             (sample_loss / batch_size).backward()
             batch_total_loss += sample_loss.item() / batch_size
             
-            if (i+1) % 500 == 0:
+            # Store Calibrator metrics for 500s AND early checks
+            if (i+1) % 500 == 0 or (i+1) in [100, 200, 300, 400]:
                 sample_name = os.path.basename(data["dir"])
                 if "calib_tracking" not in log_metrics:
                     log_metrics["calib_tracking"] = {}
@@ -260,6 +272,8 @@ def main():
                     "shift": calib_shift[0,0].item()
                 }
                 
+            # Keep the other heavy metrics only on 500s
+            if (i+1) % 500 == 0:
                 log_metrics["rgb"] = loss_rgb.item()
                 log_metrics["nv"] = loss_novel_view.item()
                 log_metrics["cent"] = loss_centroid.item()
@@ -276,6 +290,12 @@ def main():
 
         optimizer.step()
         
+        # --- Early Blow-up Catch (Iterates over ALL samples) ---
+        if (i+1) in [100, 200, 300, 400]:
+            print(f"\n[Early Check Iter {i+1:04d}] Calibrator Tracking:")
+            for s_name, vals in log_metrics["calib_tracking"].items():
+                print(f"     > Sample {s_name}: Scale = {vals['scale']:.4f}, Shift = {vals['shift']:.4f}")
+        
         if (i+1) % 500 == 0:
             print(f"\nIter {i+1:04d} | Batch Avg Total: {batch_total_loss:.4f}")
             print(f"   [Calibrator Tracking]")
@@ -287,7 +307,7 @@ def main():
             print(f"     > NV Grad Mag: {log_metrics['nv_grad']:.10f} | Off-screen B: {log_metrics['frac_off']:.2%}")
             print("-" * 50)
             
-        # --- NEW: Checkpointing every 1000 iterations ---
+        # --- Checkpointing every 1000 iterations ---
         if (i+1) % 1000 == 0:
             checkpoint_path = f"checkpoint_iter{i+1}.pt"
             torch.save({
