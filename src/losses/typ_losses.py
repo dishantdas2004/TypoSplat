@@ -160,13 +160,14 @@ def compute_novel_view_loss(means, quats, scales, opacities, colors, viewmats_B,
     
     return loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B
 
-def compute_centroid_loss(means, viewmats_B, K_B, mask_518_B, device):
+def compute_centroid_loss(means, viewmats_B, K_B, mask_518_B, device, sigma=200.0):
     """
     Bypasses gsplat's rasterizer entirely (plain matrix projection), so it
     can provide gradient even when Gaussians are fully off-screen and
     therefore invisible/zero-gradient to the photometric novel-view loss.
-    Purely a bootstrap signal — pulls the coarse centroid of predicted
-    Gaussians toward the real letter centroid in Camera B's frame.
+    Uses a robust, bounded loss (not plain L1) so the gradient decays to
+    zero for hopelessly-far targets, instead of pushing the calibrator
+    toward infinity forever.
     """
     means_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)
     cam_coords = (viewmats_B[0] @ means_h.T).T[:, :3]
@@ -187,10 +188,12 @@ def compute_centroid_loss(means, viewmats_B, K_B, mask_518_B, device):
     pred_centroid = torch.cat([u, v], dim=1).mean(dim=0)
     
     target_px = torch.nonzero(mask_518_B.squeeze(), as_tuple=False).float()
-    # mask indices are (row,col)=(y,x); flip to (x,y) to match pred_centroid ordering
-    target_centroid = target_px.mean(dim=0).flip(0)  
+    target_centroid = target_px.mean(dim=0).flip(0)
     
-    return torch.nn.functional.l1_loss(pred_centroid, target_centroid)
+    dist_sq = torch.sum((pred_centroid - target_centroid) ** 2)
+    loss = 1.0 - torch.exp(-dist_sq / (2.0 * sigma ** 2))
+    
+    return loss
 
 def compute_zoffset_regularization(params_1, params_2, target_per_layer=0.0562):
     """
