@@ -176,6 +176,13 @@ def main():
     decoder.train()
     
     for i in tqdm(range(iterations)):
+        # --- FIXED: Calibrator LR Warmup ---
+        if i < 500:
+            warmup_lr = 1e-7 + (i / 500.0) * (1e-5 - 1e-7)
+            optimizer.param_groups[1]['lr'] = warmup_lr
+        else:
+            optimizer.param_groups[1]['lr'] = 1e-5
+
         optimizer.zero_grad()
         
         batch_total_loss = 0.0
@@ -283,9 +290,19 @@ def main():
                     means_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)
                     points_camB = (data["viewmats_B"][0] @ means_h.T).T
                     Ks_B = data["Ks_B"]
-                    x_proj = (points_camB[:, 0] / points_camB[:, 2]) * Ks_B[0,0,0] + Ks_B[0,0,2]
-                    y_proj = (points_camB[:, 1] / points_camB[:, 2]) * Ks_B[0,1,1] + Ks_B[0,1,2]
-                    out_of_bounds = (x_proj < 0) | (x_proj > 518) | (y_proj < 0) | (y_proj > 518) | (points_camB[:, 2] <= 0)
+                    
+                    # --- FIXED: Robust Z bounds for internal off-screen logging ---
+                    Z_MIN = 1.0
+                    valid_z = points_camB[:, 2] > Z_MIN
+                    Z_safe = points_camB[:, 2].clone()
+                    Z_safe[~valid_z] = 1.0
+                    
+                    x_proj = (points_camB[:, 0] / Z_safe) * Ks_B[0,0,0] + Ks_B[0,0,2]
+                    y_proj = (points_camB[:, 1] / Z_safe) * Ks_B[0,1,1] + Ks_B[0,1,2]
+                    
+                    in_frame = valid_z & (x_proj >= 0) & (x_proj <= 518) & (y_proj >= 0) & (y_proj <= 518)
+                    out_of_bounds = ~in_frame
+                    
                     log_metrics["frac_off"] = out_of_bounds.float().mean().item()
 
         optimizer.step()
