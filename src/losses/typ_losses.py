@@ -161,14 +161,6 @@ def compute_novel_view_loss(means, quats, scales, opacities, colors, viewmats_B,
     return loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B
 
 def compute_centroid_loss(means, viewmats_B, K_B, mask_518_B, device, sigma=200.0):
-    """
-    Bypasses gsplat's rasterizer entirely (plain matrix projection), so it
-    can provide gradient even when Gaussians are fully off-screen and
-    therefore invisible/zero-gradient to the photometric novel-view loss.
-    Uses a robust, bounded loss (not plain L1) so the gradient decays to
-    zero for hopelessly-far targets, instead of pushing the calibrator
-    toward infinity forever.
-    """
     means_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)
     cam_coords = (viewmats_B[0] @ means_h.T).T[:, :3]
     
