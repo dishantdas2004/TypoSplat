@@ -9,6 +9,7 @@ import glob
 import json
 import torch
 import torch.optim as optim
+import pandas as pd  # <-- NEW: Added pandas for CSV loading
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -34,6 +35,7 @@ from src.losses.typ_losses import (
     compute_centroid_loss,
     compute_zoffset_regularization,
     compute_opacity_sparsity_loss,
+    compute_calibrator_regression_loss, # <-- NEW: Imported auxiliary regression loss
     _get_relative_viewmat
 )
 from src.data.mask_generator import get_letter_mask
@@ -93,6 +95,15 @@ def main():
     sample_dirs = sys.argv[1:] if len(sys.argv) > 1 else ["/content/data/19"]
     print(f"Loading {len(sample_dirs)} samples for batched training...")
 
+    # --- NEW: Load diagnostic targets for calibrator regression ---
+    # Update this path to where your diagnostic_results.csv is located in Colab
+    try:
+        diagnostic_df = pd.read_csv("/content/diagnostic_results.csv")
+        diagnostic_df = diagnostic_df.set_index("Sample")
+        print(f"Diagnostic CSV Index dtype: {diagnostic_df.index.dtype}")
+    except FileNotFoundError:
+        print("WARNING: diagnostic_results.csv not found! Training will fail if not provided.")
+
     vggt = VGGTWrapper().to(device) 
     for param in vggt.parameters():
         param.requires_grad = False
@@ -136,6 +147,11 @@ def main():
         with torch.no_grad():
             vggt_out = vggt.forward_with_features(gt_rgb_A) 
 
+        # --- NEW: Pull targets using robust sample_id indexing ---
+        sample_id = os.path.basename(sample_dir)
+        target_opt_scale = float(diagnostic_df.loc[int(sample_id), "Opt_Scale"])
+        target_opt_shift = float(diagnostic_df.loc[int(sample_id), "Opt_Shift"])
+
         dataset.append({
             "dir": sample_dir,
             "meta": meta,
@@ -152,7 +168,9 @@ def main():
             "Ks_B": Ks_B,
             "viewmats_B": viewmats_B,
             "patch_tokens": vggt_out["patch_tokens"],
-            "base_depth": vggt_out["depth"]
+            "base_depth": vggt_out["depth"],
+            "target_opt_scale": target_opt_scale,  # <-- NEW: Stored for regression target
+            "target_opt_shift": target_opt_shift   # <-- NEW: Stored for regression target
         })
 
     upsampler = TypoSplatUpsampler(in_channels=2048, out_channels=256).to(device)
@@ -220,7 +238,7 @@ def main():
 
             # --- Symmetric Novel View Photometric Suite ---
             loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B = compute_novel_view_loss(
-                means, quats, scales, opacities, colors, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], lpips_fn
+                means, quats, scales, opacities, colors, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], lpips_fn, iteration=i
             )
 
             loss_novel_view = loss_rgb_B + loss_edge_B + (0.002 * loss_lpips_B)
@@ -232,6 +250,15 @@ def main():
             # --- Soft L2 Regularization on raw calibrator output ---
             loss_calib_reg = (raw_calib_out ** 2).mean()
 
+            # --- NEW: Auxiliary Calibrator Regression Loss ---
+            calib_reg_weight = max(0.1, 1.0 - i / 1000.0)
+            loss_calib_target = compute_calibrator_regression_loss(
+                calib_scale, 
+                calib_shift, 
+                torch.tensor(data["target_opt_scale"], device=device), 
+                torch.tensor(data["target_opt_shift"], device=device)
+            )
+
             centroid_weight = max(0.0, 1.0 - i / 1500.0)
 
             # --- Print raw magnitudes on Iter 0 for ALL samples ---
@@ -241,6 +268,7 @@ def main():
                 print(f"Raw RGB B:   {loss_rgb_B.item():.4f}")
                 print(f"Raw Edge B:  {loss_edge_B.item():.4f}")
                 print(f"Raw LPIPS B: {loss_lpips_B.item():.4f}")
+                print(f"Raw Calib Regression: {loss_calib_target.item():.4f} (Weight: {calib_reg_weight * 2.0:.2f})") # <-- NEW: Logging at Iter 0
                 print("-" * 50)
 
             # Extract NV Gradient for diagnostic before the graph is consumed
@@ -249,6 +277,18 @@ def main():
                 nv_grad = torch.autograd.grad(loss_novel_view, means, retain_graph=True, allow_unused=True)[0]
                 nv_grad_mag = nv_grad.abs().mean().item() if nv_grad is not None else 0.0
 
+                # --- BBox overlap check ---
+                with torch.no_grad():
+                    non_zero_pixels = torch.nonzero(render_colors_B[0].sum(-1) > 0.01, as_tuple=False)
+                    mask_pixels = torch.nonzero(data["mask_518_B"].squeeze() > 0.5, as_tuple=False)
+                    sample_name = os.path.basename(data["dir"])
+                    if len(non_zero_pixels) > 0:
+                        print(f"[BBOX CHECK - Sample {sample_name}] Render bbox: Y[{non_zero_pixels[:,0].min().item()}-{non_zero_pixels[:,0].max().item()}] X[{non_zero_pixels[:,1].min().item()}-{non_zero_pixels[:,1].max().item()}]")
+                    else:
+                        print(f"[BBOX CHECK - Sample {sample_name}] Render bbox: EMPTY (no pixels above threshold)")
+                    print(f"[BBOX CHECK - Sample {sample_name}] Mask bbox:   Y[{mask_pixels[:,0].min().item()}-{mask_pixels[:,0].max().item()}] X[{mask_pixels[:,1].min().item()}-{mask_pixels[:,1].max().item()}]")
+
+            # --- Cleanly Integrated Unified Sum ---
             sample_loss = (
                 1.0 * loss_rgb + 
                 1.0 * loss_edge + 
@@ -261,7 +301,8 @@ def main():
                 centroid_weight * 0.05 * loss_centroid +
                 0.05 * loss_zreg +
                 1.0 * loss_opacity_sparsity +
-                0.01 * loss_calib_reg  # Added Calibrator L2 Penalty
+                0.01 * loss_calib_reg +
+                (calib_reg_weight * 2.0 * loss_calib_target)  # <-- NEW: Auxiliary Regression Loss Added Here
             )
 
             # Accumulate gradient safely
@@ -276,7 +317,10 @@ def main():
 
                 log_metrics["calib_tracking"][sample_name] = {
                     "scale": calib_scale[0,0].item(),
-                    "shift": calib_shift[0,0].item()
+                    "shift": calib_shift[0,0].item(),
+                    "target_scale": data["target_opt_scale"],  # <-- NEW: Track for print
+                    "target_shift": data["target_opt_shift"],  # <-- NEW: Track for print
+                    "reg_loss": loss_calib_target.item()       # <-- NEW: Track for print
                 }
 
             # Keep the other heavy metrics only on 500s
@@ -285,13 +329,14 @@ def main():
                 log_metrics["nv"] = loss_novel_view.item()
                 log_metrics["cent"] = loss_centroid.item()
                 log_metrics["nv_grad"] = nv_grad_mag
+                log_metrics["calib_reg_weight"] = calib_reg_weight * 2.0  # <-- NEW
 
                 with torch.no_grad():
                     means_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)
                     points_camB = (data["viewmats_B"][0] @ means_h.T).T
                     Ks_B = data["Ks_B"]
 
-                    # --- FIXED: Robust Z bounds for internal off-screen logging ---
+                    # --- Robust Z bounds for internal off-screen logging ---
                     Z_MIN = 1.0
                     valid_z = points_camB[:, 2] > Z_MIN
                     Z_safe = points_camB[:, 2].clone()
@@ -311,13 +356,14 @@ def main():
         if (i+1) in [100, 200, 300, 400]:
             print(f"\n[Early Check Iter {i+1:04d}] Calibrator Tracking:")
             for s_name, vals in log_metrics["calib_tracking"].items():
-                print(f"     > Sample {s_name}: Scale = {vals['scale']:.4f}, Shift = {vals['shift']:.4f}")
+                print(f"     > Sample {s_name}: Scale = {vals['scale']:.4f} (Target: {vals['target_scale']:.4f}), Shift = {vals['shift']:.4f} (Target: {vals['target_shift']:.4f})")
 
         if (i+1) % 500 == 0:
             print(f"\nIter {i+1:04d} | Batch Avg Total: {batch_total_loss:.4f}")
             print(f"   [Calibrator Tracking]")
             for s_name, vals in log_metrics["calib_tracking"].items():
-                print(f"     > Sample {s_name}: Scale = {vals['scale']:.4f}, Shift = {vals['shift']:.4f}")
+                print(f"     > Sample {s_name}: Scale = {vals['scale']:.4f} (Target: {vals['target_scale']:.4f}) | Shift = {vals['shift']:.4f} (Target: {vals['target_shift']:.4f})")
+                print(f"       Reg Loss: {vals['reg_loss']:.4f} (Weight: {log_metrics['calib_reg_weight']:.2f})")
 
             print(f"   [General Metrics (Sample {os.path.basename(dataset[-1]['dir'])})]")
             print(f"     > RGB: {log_metrics['rgb']:.4f} | Novel View: {log_metrics['nv']:.4f} | Centroid: {log_metrics['cent']:.4f}")

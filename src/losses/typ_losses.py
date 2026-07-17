@@ -7,6 +7,7 @@ for typography-focused 3D Gaussian Splatting reconstruction.
 
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 # Import both the normal converter and the safety helper
 from src.models.edge_predictor import depth_to_normal, _reshape_intrinsic
 from gsplat import rasterization
@@ -138,7 +139,7 @@ def _get_relative_viewmat(c2w_A_list, c2w_B_list, device):
     w2c_B_cv = torch.linalg.inv(c2w_B_cv)
     return (w2c_B_cv @ c2w_A_cv).unsqueeze(0)
 
-def compute_novel_view_loss(means, quats, scales, opacities, colors, viewmats_B, Ks_B, gt_rgb_B, mask_518_B, lpips_fn):
+def compute_novel_view_loss(means, quats, scales, opacities, colors, viewmats_B, Ks_B, gt_rgb_B, mask_518_B, lpips_fn, iteration, warmup_iters=1500, max_sigma=100.0):
     from gsplat import rasterization
     from src.losses.render_losses import compute_l1_rgb_loss, compute_sobel_edge_loss
     
@@ -149,13 +150,34 @@ def compute_novel_view_loss(means, quats, scales, opacities, colors, viewmats_B,
     
     pred_rgb_B_raw = render_colors_B.permute(0, 3, 1, 2)
     
-    # 1. Hard-gate the render for L1 and Sobel to prevent blocky 148-grid bleeding
-    pred_rgb_B_masked = pred_rgb_B_raw * mask_518_B
+    # --- Coarse-to-Fine Gaussian Blur (Widens the Basin of Attraction) ---
+    progress = min(1.0, iteration / warmup_iters)
+    current_sigma = max_sigma * (1.0 - progress)
     
-    loss_rgb_B = compute_l1_rgb_loss(pred_rgb_B_masked, gt_rgb_B, mask=mask_518_B)
-    loss_edge_B = compute_sobel_edge_loss(pred_rgb_B_masked, gt_rgb_B, mask=mask_518_B)
+    if current_sigma > 0.5:
+        # Kernel size spans ~4 sigma and must be odd
+        kernel_size = int(current_sigma * 4) | 1  
+        
+        # Blur and clamp defensively to prevent floating point drift
+        pred_blurred = TF.gaussian_blur(pred_rgb_B_raw, kernel_size, [current_sigma, current_sigma]).clamp(0.0, 1.0)
+        gt_blurred = TF.gaussian_blur(gt_rgb_B, kernel_size, [current_sigma, current_sigma]).clamp(0.0, 1.0)
+        
+        # Blurring the binary mask creates a soft, feathered weight map [0,1], NOT a hard dilated wall
+        mask_blurred = TF.gaussian_blur(mask_518_B, kernel_size, [current_sigma, current_sigma]).clamp(0.0, 1.0)
+    else:
+        pred_blurred = pred_rgb_B_raw
+        gt_blurred = gt_rgb_B
+        mask_blurred = mask_518_B
+        
+    # 1. Mask the blurred renders for L1 and Sobel computation
+    pred_rgb_B_masked = pred_blurred * mask_blurred
     
-    # 2. Pass RAW unmasked render to LPIPS (VGG) to prevent artificial cutout edges
+    loss_rgb_B = compute_l1_rgb_loss(pred_rgb_B_masked, gt_blurred, mask=mask_blurred)
+    loss_edge_B = compute_sobel_edge_loss(pred_rgb_B_masked, gt_blurred, mask=mask_blurred)
+    
+    # 2. Pass RAW unmasked render to LPIPS with the ORIGINAL TIGHT mask.
+    # LPIPS operates on deep feature maps which already have wide receptive fields;
+    # blurring its inputs would corrupt the perceptual space.
     loss_lpips_B = lpips_fn(pred_rgb_B_raw, gt_rgb_B, mask=mask_518_B)
     
     return loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B
@@ -206,3 +228,14 @@ def compute_opacity_sparsity_loss(opacities):
     Maximum penalty is applied when opacity is exactly 0.5.
     """
     return (opacities * (1.0 - opacities)).mean()
+
+
+def compute_calibrator_regression_loss(calib_scale, calib_shift, target_opt_scale, target_opt_shift):
+    """
+    Direct regression supervision for the depth calibrator, using closed-form
+    least-squares Opt_Scale/Opt_Shift as the training target. Training-only
+    signal — does not change calibrator inputs or inference-time behavior.
+    """
+    loss_scale = (calib_scale.squeeze() - target_opt_scale) ** 2
+    loss_shift = (calib_shift.squeeze() - target_opt_shift) ** 2
+    return (loss_scale + loss_shift).mean()
