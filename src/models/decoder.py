@@ -21,26 +21,35 @@ class DepthCalibrator(nn.Module):
     VGGT normalizes depth per-scene (not true metric scale) — a single
     dataset-wide constant would not generalize across samples with
     different scene geometry.
+    Uses attention pooling instead of global average pooling: a learnable
+    query token attends over the full 37x37 spatial patch grid, so the
+    network can learn to search for and weight the specific spatial
+    locations (ground-plane, structural anchors) that actually carry
+    scale information, rather than averaging that information away.
     """
-    def __init__(self, feature_dim=2048):
+    def __init__(self, feature_dim=2048, num_heads=4):
         super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, feature_dim) * 0.02)
+        self.attn = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads, batch_first=True)
         self.fc = nn.Linear(feature_dim, 2)
+        
         # Zero-init both weight and bias -> exact identity at iteration 0
-        # (scale=1.0, shift=0.0), so this starts harmless and only
-        # learns a correction as training provides evidence for one.
         nn.init.zeros_(self.fc.weight)
         nn.init.zeros_(self.fc.bias)
 
     def forward(self, patch_tokens):
-        # patch_tokens: [B, 2048, 37, 37] from VGGTWrapper.forward_with_features()
-        pooled = patch_tokens.mean(dim=[2, 3])  
+        # patch_tokens: [B, 2048, 37, 37] -> flatten spatial dims for attention
+        B, C, H, W = patch_tokens.shape
+        tokens_flat = patch_tokens.view(B, C, H * W).permute(0, 2, 1)  # [B, 1369, 2048]
+        q = self.query.expand(B, -1, -1)  # [B, 1, 2048]
+        
+        pooled, _ = self.attn(q, tokens_flat, tokens_flat)  # [B, 1, 2048]
+        pooled = pooled.squeeze(1)  # [B, 2048]
+        
         out = self.fc(pooled)
         scale = 1.0 + out[:, 0:1]
         shift = out[:, 1:2]
-        
-        # --- NEW: Return raw 'out' for L2 regularization ---
         return scale, shift, out
-    
 
 class GaussianParameterHead(nn.Module):
     def __init__(self, in_channels, scale_bias=-5.0, target_total_extrusion=0.1124): 
@@ -57,7 +66,6 @@ class GaussianParameterHead(nn.Module):
         self.head.bias.data[7] = 1.0 
         
         # 2. Cumulative Z-Offset Bias
-        # Target is split across 2 offset layers to achieve the total target extrusion
         per_layer_offset = target_total_extrusion / 2.0
         self.head.bias.data[2] = math.log(per_layer_offset)
 
@@ -110,7 +118,7 @@ class TypoSplatDecoder(nn.Module):
         )
         self.head_2 = GaussianParameterHead(trunk_channels)
         
-        # NEW: Global depth calibration to pull Gaussians into metric space
+        # Global depth calibration to pull Gaussians into metric space
         self.calibrator = DepthCalibrator(feature_dim=2048)
 
     def forward(self, features, base_depth_518, patch_tokens):
@@ -136,7 +144,6 @@ class TypoSplatDecoder(nn.Module):
             align_corners=False
         )
         
-        # --- NEW: Catch the raw output ---
         scale, shift, raw_calib_out = self.calibrator(patch_tokens)
         scale_view = scale.view(-1, 1, 1, 1)
         shift_view = shift.view(-1, 1, 1, 1)
@@ -147,7 +154,6 @@ class TypoSplatDecoder(nn.Module):
         params_1["true_depth"] = base_depth_148 + params_1["z_offset"]
         params_2["true_depth"] = base_depth_148 + params_1["z_offset"] + params_2["z_offset"]
         
-        # --- NEW: Return the raw output ---
         return [params_0, params_1, params_2], scale, shift, raw_calib_out
 
 if __name__ == "__main__":
@@ -166,9 +172,10 @@ if __name__ == "__main__":
     B, H, W = 2, 148, 148
     dummy_features = torch.randn(B, 258, H, W, device=device)
     dummy_base_depth = torch.ones(B, 1, 518, 518, device=device) * 5.0 # Flat 5m depth wall
+    dummy_patch_tokens = torch.randn(B, 2048, 37, 37, device=device)
     
     # Forward pass
-    layers = decoder(dummy_features, dummy_base_depth)
+    layers, scale, shift, raw_calib_out = decoder(dummy_features, dummy_base_depth, dummy_patch_tokens)
     
     print(f"Generated {len(layers)} depth layers.")
     

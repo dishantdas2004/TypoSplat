@@ -95,21 +95,6 @@ def compute_extrusion_loss(params_1, params_2, target_extrusion, letter_mask_148
     loss = torch.sum(sq_err * letter_mask_148.float()) / n_pixels
     return loss
 
-def compute_masked_depth_loss(params_0, gt_depth_148, letter_mask_148):
-    """
-    Binds the front-face Gaussian centers (Layer 0 true depth) directly to the 
-    downsampled ground truth depth map layout.
-    """
-    pred_front_depth = params_0["true_depth"]
-    
-    abs_err = torch.abs(pred_front_depth - gt_depth_148)
-    
-    n_pixels = letter_mask_148.float().sum()
-    if n_pixels == 0:
-        return torch.tensor(0.0, device=pred_front_depth.device)
-        
-    loss = torch.sum(abs_err * letter_mask_148.float()) / n_pixels
-    return loss
 
 def compute_anisotropy_loss(scales, r_bound=10.0):
     """
@@ -233,9 +218,14 @@ def compute_opacity_sparsity_loss(opacities):
 def compute_calibrator_regression_loss(calib_scale, calib_shift, target_opt_scale, target_opt_shift):
     """
     Direct regression supervision for the depth calibrator, using closed-form
-    least-squares Opt_Scale/Opt_Shift as the training target. Training-only
-    signal — does not change calibrator inputs or inference-time behavior.
+    least-squares Opt_Scale/Opt_Shift as the training target.
+    Uses relative/normalized formulation so large targets do not produce
+    disproportionately larger gradients.
     """
-    loss_scale = (calib_scale.squeeze() - target_opt_scale) ** 2
-    loss_shift = (calib_shift.squeeze() - target_opt_shift) ** 2
+    scale_denom = target_opt_scale.detach().abs() + 1.0
+    shift_denom = target_opt_shift.detach().abs() + 1.0
+    
+    loss_scale = ((calib_scale.squeeze() - target_opt_scale) ** 2) / scale_denom
+    loss_shift = ((calib_shift.squeeze() - target_opt_shift) ** 2) / shift_denom
+    
     return (loss_scale + loss_shift).mean()

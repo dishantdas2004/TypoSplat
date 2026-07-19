@@ -9,7 +9,7 @@ import glob
 import json
 import torch
 import torch.optim as optim
-import pandas as pd  # <-- NEW: Added pandas for CSV loading
+import pandas as pd  
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -35,7 +35,7 @@ from src.losses.typ_losses import (
     compute_centroid_loss,
     compute_zoffset_regularization,
     compute_opacity_sparsity_loss,
-    compute_calibrator_regression_loss, # <-- NEW: Imported auxiliary regression loss
+    compute_calibrator_regression_loss, 
     _get_relative_viewmat
 )
 from src.data.mask_generator import get_letter_mask
@@ -91,16 +91,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"=== TypoSplat: Stage 0 Training (Mini-Batch Calibrator Test) ===")
 
-    # Accept multiple directories from CLI
     sample_dirs = sys.argv[1:] if len(sys.argv) > 1 else ["/content/data/19"]
     print(f"Loading {len(sample_dirs)} samples for batched training...")
 
-    # --- NEW: Load diagnostic targets for calibrator regression ---
-    # Update this path to where your diagnostic_results.csv is located in Colab
     try:
         diagnostic_df = pd.read_csv("/content/diagnostic_results.csv")
         diagnostic_df = diagnostic_df.set_index("Sample")
-        print(f"Diagnostic CSV Index dtype: {diagnostic_df.index.dtype}")
     except FileNotFoundError:
         print("WARNING: diagnostic_results.csv not found! Training will fail if not provided.")
 
@@ -110,7 +106,6 @@ def main():
 
     dataset = []
 
-    # Pre-cache all GT data and VGGT features to save memory and time
     for sample_dir in sample_dirs:
         meta_path = os.path.join(sample_dir, "metadata.json")
         mesh_path = os.path.join(sample_dir, "mesh.ply")
@@ -147,7 +142,6 @@ def main():
         with torch.no_grad():
             vggt_out = vggt.forward_with_features(gt_rgb_A) 
 
-        # --- NEW: Pull targets using robust sample_id indexing ---
         sample_id = os.path.basename(sample_dir)
         target_opt_scale = float(diagnostic_df.loc[int(sample_id), "Opt_Scale"])
         target_opt_shift = float(diagnostic_df.loc[int(sample_id), "Opt_Shift"])
@@ -169,15 +163,14 @@ def main():
             "viewmats_B": viewmats_B,
             "patch_tokens": vggt_out["patch_tokens"],
             "base_depth": vggt_out["depth"],
-            "target_opt_scale": target_opt_scale,  # <-- NEW: Stored for regression target
-            "target_opt_shift": target_opt_shift   # <-- NEW: Stored for regression target
+            "target_opt_scale": target_opt_scale,
+            "target_opt_shift": target_opt_shift
         })
 
     upsampler = TypoSplatUpsampler(in_channels=2048, out_channels=256).to(device)
     decoder = TypoSplatDecoder(in_channels=258).to(device)
     lpips_fn = ShallowPerceptualLoss(device)
 
-    # --- Split Optimizer Groups (Calibrator gets 10x slower LR) ---
     calibrator_params = list(decoder.calibrator.parameters())
     base_params = list(upsampler.parameters()) + [p for n, p in decoder.named_parameters() if 'calibrator' not in n]
 
@@ -186,7 +179,7 @@ def main():
         {'params': calibrator_params, 'lr': 1e-5}
     ])
 
-    iterations = 2000 
+    iterations = 800 
     batch_size = len(dataset)
 
     print("\nStarting Training Loop...")
@@ -194,7 +187,6 @@ def main():
     decoder.train()
 
     for i in tqdm(range(iterations)):
-        # --- FIXED: Calibrator LR Warmup ---
         if i < 500:
             warmup_lr = 1e-7 + (i / 500.0) * (1e-5 - 1e-7)
             optimizer.param_groups[1]['lr'] = warmup_lr
@@ -202,15 +194,15 @@ def main():
             optimizer.param_groups[1]['lr'] = 1e-5
 
         optimizer.zero_grad()
-
+        
         batch_total_loss = 0.0
         log_metrics = {} 
 
         for data in dataset:
             upsampled_features = upsampler(data["patch_tokens"])
 
-            # --- Unpack raw_calib_out for L2 Regularization ---
-            params_list, calib_scale, calib_shift, raw_calib_out = decoder(upsampled_features, data["base_depth"], data["patch_tokens"])
+            # --- UPDATED: Ignored raw_calib_out since we deleted the L2 penalty ---
+            params_list, calib_scale, calib_shift, _ = decoder(upsampled_features, data["base_depth"], data["patch_tokens"])
             params_0, params_1, params_2 = params_list
 
             means, quats, scales, opacities, colors = flatten_decoder_outputs_camera_space(
@@ -222,8 +214,6 @@ def main():
                 viewmats=data["viewmats_A"], Ks=data["Ks_A"], width=518, height=518,
             )
             pred_rgb_A_raw = render_colors_A.permute(0, 3, 1, 2)
-
-            # --- Mask-Resolution Fix (Branching) ---
             pred_rgb_A_masked = pred_rgb_A_raw * data["mask_518_A"]
 
             loss_rgb = compute_l1_rgb_loss(pred_rgb_A_masked, data["gt_rgb_A"], mask=data["mask_518_A"])
@@ -236,22 +226,18 @@ def main():
             loss_aniso = compute_anisotropy_loss(scales, r_bound=10.0)
             loss_normal = compute_normal_loss(layer_1_depth, data["gt_depth_148_A"], data["intrinsics_dict_148_A"], data["mask_148_A"])
 
-            # --- Symmetric Novel View Photometric Suite ---
             loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B = compute_novel_view_loss(
                 means, quats, scales, opacities, colors, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], lpips_fn, iteration=i
             )
 
             loss_novel_view = loss_rgb_B + loss_edge_B + (0.002 * loss_lpips_B)
-
             loss_centroid = compute_centroid_loss(means, data["viewmats_B"], data["Ks_B"], data["mask_518_B"], device)
             loss_zreg = compute_zoffset_regularization(params_1, params_2)
             loss_opacity_sparsity = compute_opacity_sparsity_loss(opacities)
 
-            # --- Soft L2 Regularization on raw calibrator output ---
-            loss_calib_reg = (raw_calib_out ** 2).mean()
-
-            # --- NEW: Auxiliary Calibrator Regression Loss ---
             calib_reg_weight = max(0.1, 1.0 - i / 1000.0)
+            centroid_weight = max(0.0, 1.0 - i / 1500.0)
+
             loss_calib_target = compute_calibrator_regression_loss(
                 calib_scale, 
                 calib_shift, 
@@ -259,25 +245,12 @@ def main():
                 torch.tensor(data["target_opt_shift"], device=device)
             )
 
-            centroid_weight = max(0.0, 1.0 - i / 1500.0)
-
-            # --- Print raw magnitudes on Iter 0 for ALL samples ---
-            if i == 0:
-                sample_name = os.path.basename(data["dir"])
-                print(f"\n--- CAMERA B RAW MAGNITUDES: Sample {sample_name} (ITER 0) ---")
-                print(f"Raw RGB B:   {loss_rgb_B.item():.4f}")
-                print(f"Raw Edge B:  {loss_edge_B.item():.4f}")
-                print(f"Raw LPIPS B: {loss_lpips_B.item():.4f}")
-                print(f"Raw Calib Regression: {loss_calib_target.item():.4f} (Weight: {calib_reg_weight * 2.0:.2f})") # <-- NEW: Logging at Iter 0
-                print("-" * 50)
-
-            # Extract NV Gradient for diagnostic before the graph is consumed
+            # --- LOGGING: Extract NV Gradient & BBox Checks FIRST (While graph is intact) ---
             nv_grad_mag = 0.0
-            if (i+1) % 500 == 0:
+            if (i+1) % 100 == 0:
                 nv_grad = torch.autograd.grad(loss_novel_view, means, retain_graph=True, allow_unused=True)[0]
                 nv_grad_mag = nv_grad.abs().mean().item() if nv_grad is not None else 0.0
 
-                # --- BBox overlap check ---
                 with torch.no_grad():
                     non_zero_pixels = torch.nonzero(render_colors_B[0].sum(-1) > 0.01, as_tuple=False)
                     mask_pixels = torch.nonzero(data["mask_518_B"].squeeze() > 0.5, as_tuple=False)
@@ -288,7 +261,7 @@ def main():
                         print(f"[BBOX CHECK - Sample {sample_name}] Render bbox: EMPTY (no pixels above threshold)")
                     print(f"[BBOX CHECK - Sample {sample_name}] Mask bbox:   Y[{mask_pixels[:,0].min().item()}-{mask_pixels[:,0].max().item()}] X[{mask_pixels[:,1].min().item()}-{mask_pixels[:,1].max().item()}]")
 
-            # --- Cleanly Integrated Unified Sum ---
+            # --- UPDATED: Removed unconditional loss_calib_reg from sum ---
             sample_loss = (
                 1.0 * loss_rgb + 
                 1.0 * loss_edge + 
@@ -301,16 +274,15 @@ def main():
                 centroid_weight * 0.05 * loss_centroid +
                 0.05 * loss_zreg +
                 1.0 * loss_opacity_sparsity +
-                0.01 * loss_calib_reg +
-                (calib_reg_weight * 2.0 * loss_calib_target)  # <-- NEW: Auxiliary Regression Loss Added Here
+                (calib_reg_weight * 2.0 * loss_calib_target) 
             )
-
-            # Accumulate gradient safely
+            
+            # --- Normal backward for entire network ---
             (sample_loss / batch_size).backward()
             batch_total_loss += sample_loss.item() / batch_size
 
-            # Store Calibrator metrics for 500s AND early checks
-            if (i+1) % 500 == 0 or (i+1) in [100, 200, 300, 400]:
+            # --- LOGGING: Collect Heavy Metrics & Tracking (Every 100 iters) ---
+            if (i+1) % 100 == 0:
                 sample_name = os.path.basename(data["dir"])
                 if "calib_tracking" not in log_metrics:
                     log_metrics["calib_tracking"] = {}
@@ -318,25 +290,22 @@ def main():
                 log_metrics["calib_tracking"][sample_name] = {
                     "scale": calib_scale[0,0].item(),
                     "shift": calib_shift[0,0].item(),
-                    "target_scale": data["target_opt_scale"],  # <-- NEW: Track for print
-                    "target_shift": data["target_opt_shift"],  # <-- NEW: Track for print
-                    "reg_loss": loss_calib_target.item()       # <-- NEW: Track for print
+                    "target_scale": data["target_opt_scale"],
+                    "target_shift": data["target_opt_shift"],
+                    "reg_loss": loss_calib_target.item()
                 }
 
-            # Keep the other heavy metrics only on 500s
-            if (i+1) % 500 == 0:
                 log_metrics["rgb"] = loss_rgb.item()
                 log_metrics["nv"] = loss_novel_view.item()
                 log_metrics["cent"] = loss_centroid.item()
                 log_metrics["nv_grad"] = nv_grad_mag
-                log_metrics["calib_reg_weight"] = calib_reg_weight * 2.0  # <-- NEW
+                log_metrics["calib_reg_weight"] = calib_reg_weight * 2.0
 
                 with torch.no_grad():
                     means_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)
                     points_camB = (data["viewmats_B"][0] @ means_h.T).T
                     Ks_B = data["Ks_B"]
 
-                    # --- Robust Z bounds for internal off-screen logging ---
                     Z_MIN = 1.0
                     valid_z = points_camB[:, 2] > Z_MIN
                     Z_safe = points_camB[:, 2].clone()
@@ -350,15 +319,26 @@ def main():
 
                     log_metrics["frac_off"] = out_of_bounds.float().mean().item()
 
+            if (i+1) in [500, 800]:
+                fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+                axes[0,0].imshow(data["gt_rgb_A"][0].permute(1, 2, 0).cpu().numpy() * data["mask_518_A"][0].permute(1, 2, 0).cpu().numpy())
+                axes[0,0].set_title("GT Camera A")
+                axes[0,1].imshow(pred_rgb_A_masked[0].permute(1,2,0).detach().cpu().numpy())
+                axes[0,1].set_title(f"Render Camera A (Iter {i+1})")
+                axes[1,0].imshow(data["gt_rgb_B"][0].permute(1, 2, 0).cpu().numpy() * data["mask_518_B"][0].permute(1, 2, 0).cpu().numpy())
+                axes[1,0].set_title("GT Camera B")
+                vis_render_B = render_colors_B.permute(0,3,1,2) * data["mask_518_B"]
+                axes[1,1].imshow(vis_render_B[0].permute(1,2,0).detach().cpu().numpy())
+                axes[1,1].set_title(f"Render Camera B (Iter {i+1})")
+                
+                out_path = os.path.join(data["dir"], f"render_iter_{i+1}.png")
+                plt.savefig(out_path, dpi=150)
+                plt.close(fig)
+
         optimizer.step()
 
-        # --- Early Blow-up Catch (Iterates over ALL samples) ---
-        if (i+1) in [100, 200, 300, 400]:
-            print(f"\n[Early Check Iter {i+1:04d}] Calibrator Tracking:")
-            for s_name, vals in log_metrics["calib_tracking"].items():
-                print(f"     > Sample {s_name}: Scale = {vals['scale']:.4f} (Target: {vals['target_scale']:.4f}), Shift = {vals['shift']:.4f} (Target: {vals['target_shift']:.4f})")
-
-        if (i+1) % 500 == 0:
+        # --- LOGGING: Final Prints (Every 100 iters) ---
+        if (i+1) % 100 == 0:
             print(f"\nIter {i+1:04d} | Batch Avg Total: {batch_total_loss:.4f}")
             print(f"   [Calibrator Tracking]")
             for s_name, vals in log_metrics["calib_tracking"].items():
@@ -370,8 +350,8 @@ def main():
             print(f"     > NV Grad Mag: {log_metrics['nv_grad']:.10f} | Off-screen B: {log_metrics['frac_off']:.2%}")
             print("-" * 50)
 
-        # --- Checkpointing every 1000 iterations ---
-        if (i+1) % 1000 == 0:
+        # Checkpoints only at 500 and 800
+        if (i+1) in [500, 800]:
             checkpoint_path = f"checkpoint_iter{i+1}.pt"
             torch.save({
                 'upsampler': upsampler.state_dict(),
@@ -379,27 +359,9 @@ def main():
                 'optimizer': optimizer.state_dict(),
                 'iteration': i+1
             }, checkpoint_path)
-            print(f"   [!] Saved checkpoint to {checkpoint_path}")
+            print(f"   [!] Saved checkpoint and images to {checkpoint_path}")
 
     print("\n[SUCCESS] Stage 0 Mini-Batch Overfit Complete!")
-
-    last_data = dataset[-1]
-    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
-    axes[0,0].imshow(last_data["gt_rgb_A"][0].permute(1, 2, 0).cpu().numpy() * last_data["mask_518_A"][0].permute(1, 2, 0).cpu().numpy())
-    axes[0,0].set_title("GT Camera A")
-
-    axes[0,1].imshow(pred_rgb_A_masked[0].permute(1,2,0).detach().cpu().numpy())
-    axes[0,1].set_title("Render Camera A (518x518 Gated)")
-
-    axes[1,0].imshow(last_data["gt_rgb_B"][0].permute(1, 2, 0).cpu().numpy() * last_data["mask_518_B"][0].permute(1, 2, 0).cpu().numpy())
-    axes[1,0].set_title("GT Camera B")
-
-    vis_render_B = render_colors_B.permute(0,3,1,2) * last_data["mask_518_B"]
-    axes[1,1].imshow(vis_render_B[0].permute(1,2,0).detach().cpu().numpy())
-    axes[1,1].set_title("Render Camera B (518x518 Gated)")
-
-    out_path = os.path.join(last_data["dir"], "batch_result_dual.png")
-    plt.savefig(out_path, dpi=150)
 
 if __name__ == "__main__":
     main()
