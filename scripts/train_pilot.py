@@ -126,6 +126,9 @@ def evaluate(eval_set, upsampler, decoder, device):
 
 
 def main():
+    random.seed(42)
+    torch.manual_seed(42)
+
     parser = argparse.ArgumentParser(description="TypoSplat Pilot Epoch Training")
     parser.add_argument("--data_dir", type=str, default="/content/data", help="Parent directory containing sample folders")
     parser.add_argument("--diag_csv", type=str, default="/content/diagnostic_results.csv", help="Path to diagnostic CSV")
@@ -221,6 +224,7 @@ def main():
     print(f"Successfully loaded {len(dataset)} samples. Ready for training.")
 
     # --- Held-out Split Logic ---
+    random.shuffle(dataset)
     eval_size = 64 if len(dataset) > 64 else max(1, len(dataset) // 5)
     eval_set = dataset[-eval_size:]
     train_set = dataset[:-eval_size]
@@ -246,6 +250,7 @@ def main():
         sys.exit(1)
 
     anneal_iters = int(iters_per_epoch * args.anneal_epochs)
+    bootstrap_iters = int(iters_per_epoch * 4.0)
     log_freq = max(1, iters_per_epoch // 4)
 
     print("\n=======================================================")
@@ -255,6 +260,7 @@ def main():
     print(f"Iters per Epoch: {iters_per_epoch}")
     print(f"Total Epochs:    {args.num_epochs}")
     print(f"Anneal Window:   {args.anneal_epochs} epochs ({anneal_iters} iters)")
+    print(f"Bootstrap Iters: {bootstrap_iters}")
     print(f"Logging Freq:    Every {log_freq} iters")
     print("=======================================================\n")
 
@@ -310,7 +316,7 @@ def main():
                 loss_normal = compute_normal_loss(layer_1_depth, data["gt_depth_148_A"], data["intrinsics_dict_148_A"], data["mask_148_A"])
 
                 loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B = compute_novel_view_loss(
-                    means, quats, scales, opacities, colors, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], lpips_fn, iteration=global_iter
+                    means, quats, scales, opacities, colors, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], lpips_fn, iteration=global_iter, warmup_iters=bootstrap_iters
                 )
 
                 loss_novel_view = loss_rgb_B + loss_edge_B + (0.002 * loss_lpips_B)
@@ -318,7 +324,7 @@ def main():
                 loss_zreg = compute_zoffset_regularization(params_1, params_2)
                 loss_opacity_sparsity = compute_opacity_sparsity_loss(opacities)
 
-                centroid_weight = max(0.0, 1.0 - global_iter / 1500.0)
+                centroid_weight = max(0.0, 1.0 - global_iter / bootstrap_iters)
                 calib_reg_weight = max(0.2, 1.0 - global_iter / anneal_iters)
 
                 loss_calib_target = compute_calibrator_regression_loss(
@@ -327,7 +333,7 @@ def main():
                     torch.tensor(data["target_opt_shift"], device=device)
                 )
 
-                # --- Loss Weight Magnitude Audit (Only First Sample of First Batch) ---
+                # --- Loss Weight Magnitude Audit ---
                 if global_iter == 0 and sample_idx == 0:
                     print("\n=== LOSS WEIGHT AUDIT (iter 0, first sample in first batch) ===")
                     terms = {
@@ -458,7 +464,6 @@ def main():
                 print(f"     > NV Grad Mag: {log_metrics['nv_grad']:.10f} | Off-screen B: {log_metrics['frac_off']:.2%}")
                 print("-" * 50)
                 
-                # --- NEW: Training Log CSV Appending ---
                 train_log_path = "training_log.csv"
                 write_header = not os.path.exists(train_log_path)
                 with open(train_log_path, "a") as f:
@@ -480,7 +485,6 @@ def main():
         mean_scale_err, mean_shift_err, per_sample_results = evaluate(eval_set, upsampler, decoder, device)
         print(f"\n[EPOCH {epoch} EVAL] Mean |scale_err| = {mean_scale_err:.4f} | Mean |shift_err| = {mean_shift_err:.4f}")
         
-        # Log to Detailed Per-Sample CSV (Tracking first 10 for detailed traces)
         per_sample_csv_path = "eval_per_sample_history.csv"
         write_header_per_sample = not os.path.exists(per_sample_csv_path)
         with open(per_sample_csv_path, "a") as f:
@@ -489,7 +493,6 @@ def main():
             for r in per_sample_results[:10]:
                 f.write(f"{epoch},{r['sample']},{r['pred_scale']:.6f},{r['target_scale']:.6f},{r['pred_shift']:.6f},{r['target_shift']:.6f},{r['attn_max']:.6f},{r['attn_std']:.6f}\n")
 
-        # Log Aggregate Metrics to Eval History
         mean_attn_max = sum(r["attn_max"] for r in per_sample_results) / len(per_sample_results)
         eval_csv_path = "eval_history.csv"
         write_header_eval = not os.path.exists(eval_csv_path)
