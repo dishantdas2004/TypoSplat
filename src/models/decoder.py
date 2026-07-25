@@ -43,13 +43,13 @@ class DepthCalibrator(nn.Module):
         tokens_flat = patch_tokens.view(B, C, H * W).permute(0, 2, 1)  # [B, 1369, 2048]
         q = self.query.expand(B, -1, -1)  # [B, 1, 2048]
         
-        pooled, _ = self.attn(q, tokens_flat, tokens_flat)  # [B, 1, 2048]
+        pooled, attn_weights = self.attn(q, tokens_flat, tokens_flat)  # [B, 1, 2048], [B, 1, 1369]
         pooled = pooled.squeeze(1)  # [B, 2048]
         
         out = self.fc(pooled)
         scale = 1.0 + out[:, 0:1]
         shift = out[:, 1:2]
-        return scale, shift, out
+        return scale, shift, out, attn_weights
 
 class GaussianParameterHead(nn.Module):
     def __init__(self, in_channels, scale_bias=-5.0, target_total_extrusion=0.1124): 
@@ -144,7 +144,7 @@ class TypoSplatDecoder(nn.Module):
             align_corners=False
         )
         
-        scale, shift, raw_calib_out = self.calibrator(patch_tokens)
+        scale, shift, raw_calib_out, attn_weights = self.calibrator(patch_tokens)
         scale_view = scale.view(-1, 1, 1, 1)
         shift_view = shift.view(-1, 1, 1, 1)
         
@@ -154,7 +154,7 @@ class TypoSplatDecoder(nn.Module):
         params_1["true_depth"] = base_depth_148 + params_1["z_offset"]
         params_2["true_depth"] = base_depth_148 + params_1["z_offset"] + params_2["z_offset"]
         
-        return [params_0, params_1, params_2], scale, shift, raw_calib_out
+        return [params_0, params_1, params_2], scale, shift, raw_calib_out, attn_weights
 
 if __name__ == "__main__":
     """
@@ -175,7 +175,7 @@ if __name__ == "__main__":
     dummy_patch_tokens = torch.randn(B, 2048, 37, 37, device=device)
     
     # Forward pass
-    layers, scale, shift, raw_calib_out = decoder(dummy_features, dummy_base_depth, dummy_patch_tokens)
+    layers, scale, shift, raw_calib_out, attn_weights = decoder(dummy_features, dummy_base_depth, dummy_patch_tokens)
     
     print(f"Generated {len(layers)} depth layers.")
     
