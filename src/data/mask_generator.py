@@ -69,7 +69,8 @@ def get_letter_mask(ply_path, meta_json, device='cpu', target_size=(148, 148), o
     raster_settings = RasterizationSettings(
         image_size=orig_size[0], 
         blur_radius=0.0, 
-        faces_per_pixel=1
+        faces_per_pixel=1,
+        bin_size=0
     )
     rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
     
