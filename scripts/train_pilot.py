@@ -325,7 +325,7 @@ def main():
                 loss_opacity_sparsity = compute_opacity_sparsity_loss(opacities)
 
                 centroid_weight = max(0.0, 1.0 - global_iter / bootstrap_iters)
-                calib_reg_weight = max(0.2, 1.0 - global_iter / anneal_iters)
+                calib_reg_weight = max(0.3, 1.0 - global_iter / anneal_iters)
 
                 loss_calib_target = compute_calibrator_regression_loss(
                     calib_scale, calib_shift, 

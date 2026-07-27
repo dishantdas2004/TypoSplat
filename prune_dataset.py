@@ -23,8 +23,9 @@ def main():
         sys.exit(1)
 
     # 1. Define the KEEP criteria exactly as requested
-    cond_a = (df['Opt_Shift'] < 2.0) & (df['Calib_Dist_px'] < 90.0)
-    cond_b = (df['Opt_Shift'] < 2.6) & (df['Calib_Dist_px'] < 75.0)
+    abs_shift = df['Opt_Shift'].abs()
+    cond_a = (abs_shift < 2.0) & (df['Calib_Dist_px'] < 95.0)
+    cond_b = (abs_shift < 2.6) & (df['Calib_Dist_px'] < 75.0)
     cond_scale = df['Opt_Scale'] < 8.0
     
     keep_mask = (cond_a | cond_b) & cond_scale
