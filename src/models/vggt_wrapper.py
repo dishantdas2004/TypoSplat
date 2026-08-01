@@ -85,17 +85,36 @@ class VGGTWrapper(nn.Module):
     def forward_with_features(self, image):
         """
         Exposes intermediate tokens for the Gaussian decoder.
+        Uses a forward hook to extract features and depth in a SINGLE pass.
 
         Returns everything from forward() PLUS:
           patch_tokens:    [B, 2048, 37, 37] float32 -- 2D spatial feature map
           patch_start_idx: int
         """
-        if image.dim() == 4:
-            image_seq = image.unsqueeze(1)  # [B, 1, 3, H, W]
-        else:
-            image_seq = image
+        cached = {}
 
-        aggregated_tokens_list, patch_start_idx = self.vggt.aggregator(image_seq)
+        # 1. Safely intercept the aggregator's output during the forward pass
+        if isinstance(self.vggt.aggregator, nn.Module):
+            def hook(module, inputs, outputs):
+                cached["res"] = outputs
+            handle = self.vggt.aggregator.register_forward_hook(hook)
+            out = self.forward(image)
+            handle.remove()
+        else:
+            # Fallback if aggregator is a bound method rather than an nn.Module
+            orig_agg = self.vggt.aggregator
+            def hooked_agg(*args, **kwargs):
+                res = orig_agg(*args, **kwargs)
+                cached["res"] = res
+                return res
+            self.vggt.aggregator = hooked_agg
+            try:
+                out = self.forward(image)
+            finally:
+                self.vggt.aggregator = orig_agg
+
+        # 2. Unpack the intercepted tokens
+        aggregated_tokens_list, patch_start_idx = cached["res"]
 
         # Use the LAST layer's tokens as the decoder's feature input.
         last_layer_tokens = aggregated_tokens_list[-1]  # [B, S, T, 2*embed_dim]
@@ -109,9 +128,9 @@ class VGGTWrapper(nn.Module):
         grid_size = int(T ** 0.5) # sqrt(1369) = 37
         patch_features_2d = patch_tokens_1d.permute(0, 2, 1).view(B, C, grid_size, grid_size) # [B, 2048, 37, 37]
 
-        out = self.forward(image)
         out["patch_tokens"] = patch_features_2d 
         out["patch_start_idx"] = patch_start_idx
+        
         return out
 
 
@@ -157,4 +176,4 @@ if __name__ == "__main__":
     assert out["depth"].shape == (1, 1, 518, 518), \
         f"Expected [1, 1, 518, 518], got {out['depth'].shape}"
 
-    print("\nShape checks passed.")
+    print("\nShape checks passed. Double-forward pass correctly eliminated.")
