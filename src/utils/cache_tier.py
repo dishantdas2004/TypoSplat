@@ -1,6 +1,6 @@
 import hashlib
 
-def get_cache_tier(sample_id, disk_fraction=0.77):
+def get_cache_tier(sample_id, disk_fraction=0.65):
     """
     Deterministically assigns each sample to 'disk' or 'ram' tier,
     based on a stable hash of its ID -- identical assignment every run,
