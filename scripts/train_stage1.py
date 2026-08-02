@@ -14,6 +14,8 @@ import json
 import shutil
 import random
 import argparse
+import uuid
+import concurrent.futures
 import torch
 import torch.optim as optim
 import pandas as pd  
@@ -70,62 +72,84 @@ def load_exr_depth(filepath, device):
 def restore_disk_tier_from_drive(sample_dirs, drive_backup_root):
     if not os.path.exists(drive_backup_root):
         return
-    restored = 0
-    for sample_dir in sample_dirs:
+
+    def _restore_single(sample_dir):
         cache_path = os.path.join(sample_dir, "cached_features.pt")
         if os.path.exists(cache_path):
-            continue
+            return 0
         sample_id = os.path.basename(sample_dir)
         src = os.path.join(drive_backup_root, f"{sample_id}.pt")
         if os.path.exists(src):
             shutil.copy2(src, cache_path)
-            restored += 1
+            return 1
+        return 0
+
+    restored = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        futures = {executor.submit(_restore_single, d): d for d in sample_dirs}
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(sample_dirs), desc="Restoring Disk Cache"):
+            try:
+                restored += future.result()
+            except Exception:
+                pass
+
     if restored:
         print(f"[INFO] Restored {restored} disk-tier cache files from Drive backup.")
 
-def build_or_load_ram_cache(all_sample_dirs, vggt, device, backup_path):
-    """
-    Globally loads or computes the RAM-tier cache for all samples (train + eval).
-    Guarantees all RAM-tier tensors stay in System RAM (CPU) in fp16.
-    """
+def build_or_load_ram_cache(all_sample_dirs, vggt, device, backup_dir, chunk_size=500):
     ram_dirs = [d for d in all_sample_dirs if get_cache_tier(int(os.path.basename(d))) == "ram"]
     ram_cache = {}
-    
-    if os.path.exists(backup_path):
-        print(f"Loading global RAM-tier cache from Drive backup: {backup_path}...")
-        ram_cache = torch.load(backup_path, map_location='cpu')
-        
+
+    if os.path.exists(backup_dir) and os.path.isdir(backup_dir):
+        chunk_files = glob.glob(os.path.join(backup_dir, "*.pt"))
+        if chunk_files:
+            print(f"Loading {len(chunk_files)} RAM-tier chunks from Drive backup...")
+            for cf in tqdm(chunk_files, desc="Loading RAM chunks"):
+                try:
+                    chunk_data = torch.load(cf, map_location='cpu')
+                    ram_cache.update(chunk_data)
+                except Exception as e:
+                    print(f"Warning: Failed to load chunk {cf} ({e}). It will be recomputed.")
+
     missing_dirs = [d for d in ram_dirs if int(os.path.basename(d)) not in ram_cache]
-    
+
     if missing_dirs:
-        print(f"Computing {len(missing_dirs)} missing RAM-tier samples...")
+        print(f"Computing {len(missing_dirs)} missing RAM-tier samples in chunks of {chunk_size}...")
         vggt.eval()
-        for d in tqdm(missing_dirs, desc="RAM-tier preload"):
-            sample_id = int(os.path.basename(d))
-            meta_path = os.path.join(d, "metadata.json")
-            mesh_path = os.path.join(d, "mesh.ply")
-            with open(meta_path, 'r') as f:
-                meta = json.load(f)
-            view_A_paths = glob.glob(os.path.join(d, "*view_A*.png"))
-            gt_rgb_A = transforms.ToTensor()(Image.open(view_A_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                vggt_out = vggt.forward_with_features(gt_rgb_A)
-            mask_148_A = get_letter_mask(mesh_path, meta, device=device)
-            mask_148_B = get_letter_mask(mesh_path, meta["camera_B"], device=device)
-            
-            # Explicitly force to CPU and fp16
-            ram_cache[sample_id] = {
-                "patch_tokens": vggt_out["patch_tokens"].cpu().half(),
-                "base_depth": vggt_out["depth"].cpu().half(),
-                "mask_148_A": mask_148_A.cpu().half(),
-                "mask_148_B": mask_148_B.cpu().half(),
-            }
-        
-        os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-        torch.save(ram_cache, backup_path)
-        print(f"Saved updated global RAM-tier backup to {backup_path}")
-        
+        os.makedirs(backup_dir, exist_ok=True)
+
+        for i in range(0, len(missing_dirs), chunk_size):
+            chunk_dirs = missing_dirs[i:i + chunk_size]
+            chunk_dict = {}
+            chunk_idx = (i // chunk_size) + 1
+            total_chunks = (len(missing_dirs) + chunk_size - 1) // chunk_size
+
+            for d in tqdm(chunk_dirs, desc=f"RAM-tier preload (Chunk {chunk_idx}/{total_chunks})"):
+                sample_id = int(os.path.basename(d))
+                meta_path = os.path.join(d, "metadata.json")
+                mesh_path = os.path.join(d, "mesh.ply")
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                view_A_paths = glob.glob(os.path.join(d, "*view_A*.png"))
+                gt_rgb_A = transforms.ToTensor()(Image.open(view_A_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    vggt_out = vggt.forward_with_features(gt_rgb_A)
+                mask_148_A = get_letter_mask(mesh_path, meta, device=device)
+                mask_148_B = get_letter_mask(mesh_path, meta["camera_B"], device=device)
+
+                chunk_dict[sample_id] = {
+                    "patch_tokens": vggt_out["patch_tokens"].cpu().half(),
+                    "base_depth": vggt_out["depth"].cpu().half(),
+                    "mask_148_A": mask_148_A.cpu().half(),
+                    "mask_148_B": mask_148_B.cpu().half(),
+                }
+
+            chunk_id = uuid.uuid4().hex[:8]
+            chunk_path = os.path.join(backup_dir, f"ram_chunk_{chunk_id}.pt")
+            torch.save(chunk_dict, chunk_path)
+            ram_cache.update(chunk_dict)
+
     return ram_cache
 
 class TypoSplatDataset(Dataset):
@@ -318,8 +342,9 @@ def main():
     parser.add_argument("--eval_data_dir", type=str, default=None, help="Directory containing separate eval sample folders (REQUIRED for true validation)")
     parser.add_argument("--checkpoint_dir", type=str, default="/content/drive/MyDrive/TypoSplat/stage1_checkpoints", help="Persistent storage directory on Google Drive")
     parser.add_argument("--disk_backup_dir", type=str, default="/content/drive/MyDrive/TypoSplat/disk_cache_backup", help="Path to disk cache backup on Drive")
-    parser.add_argument("--ram_backup_path", type=str, default="/content/drive/MyDrive/TypoSplat/ram_cache_backup.pt", help="Path to single bulk RAM cache backup on Drive")
+    parser.add_argument("--ram_backup_dir", type=str, default="/content/drive/MyDrive/TypoSplat/ram_cache_backup", help="Directory for chunked RAM cache backups on Drive")
     parser.add_argument("--batch_size", type=int, default=16, help="Mini-batch size")
+    parser.add_argument("--num_epochs", type=int, default=30, help="Total training epochs")
     args = parser.parse_args()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -372,7 +397,7 @@ def main():
     restore_disk_tier_from_drive(all_sample_dirs, args.disk_backup_dir)
 
     # --- Global CPU RAM Cache Preload ---
-    global_ram_cache = build_or_load_ram_cache(all_sample_dirs, vggt, device, args.ram_backup_path)
+    global_ram_cache = build_or_load_ram_cache(all_sample_dirs, vggt, device, args.ram_backup_dir)
 
     # --- Construct Datasets ---
     train_dataset = TypoSplatDataset(train_dirs, master_diag_df, global_ram_cache, vggt, device)
@@ -401,7 +426,7 @@ def main():
         {'params': calibrator_params, 'lr': 1e-5}
     ])
 
-    num_epochs = 35
+    num_epochs = args.num_epochs
     iters_per_epoch = len(train_dataset) // args.batch_size
     bootstrap_iters = int(iters_per_epoch * 4.0)
     anneal_iters = int(iters_per_epoch * 4.0)
@@ -500,7 +525,45 @@ def main():
                     torch.tensor(data["target_opt_shift"], device=device)
                 )
 
-                # Capture weighted loss components for tracking
+                if batch_idx == len(train_dataloader) - 1 and sample_idx == 0:
+                    nv_grad = torch.autograd.grad(loss_novel_view, means, retain_graph=True, allow_unused=True)[0]
+                    nv_grad_mag = nv_grad.abs().mean().item() if nv_grad is not None else 0.0
+
+                    with torch.no_grad():
+                        means_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)
+                        points_camB = (data["viewmats_B"][0] @ means_h.T).T
+                        Ks_B = data["Ks_B"]
+                        Z_MIN = 1.0
+                        valid_z = points_camB[:, 2] > Z_MIN
+                        Z_safe = points_camB[:, 2].clone()
+                        Z_safe[~valid_z] = 1.0
+                        x_proj = (points_camB[:, 0] / Z_safe) * Ks_B[0,0,0] + Ks_B[0,0,2]
+                        y_proj = (points_camB[:, 1] / Z_safe) * Ks_B[0,1,1] + Ks_B[0,1,2]
+                        in_frame = valid_z & (x_proj >= 0) & (x_proj <= 518) & (y_proj >= 0) & (y_proj <= 518)
+                        frac_offscreen = (~in_frame).float().mean().item()
+                    
+                    last_batch_metrics = (nv_grad_mag, frac_offscreen)
+
+                # Real tensor loss for backpropagation
+                sample_loss_tensor = (
+                    1.0 * loss_rgb +
+                    1.0 * loss_edge +
+                    0.002 * loss_lpips +
+                    50.0 * loss_depth +
+                    1000.0 * loss_extrusion +
+                    1.0 * loss_aniso +
+                    1.0 * loss_normal +
+                    0.5 * loss_novel_view +
+                    (centroid_weight * 0.05 * loss_centroid) +
+                    0.05 * loss_zreg +
+                    1.0 * loss_opacity_sparsity +
+                    (calib_reg_weight * 2.0 * loss_calib_target)
+                )
+                
+                (sample_loss_tensor / args.batch_size).backward()
+                batch_total_loss += sample_loss_tensor.item() / args.batch_size
+
+                # Item-based dictionary strictly for logging
                 weighted_terms = {
                     "rgb": 1.0 * loss_rgb.item(),
                     "edge": 1.0 * loss_edge.item(),
@@ -526,30 +589,6 @@ def main():
                         print(f"  {name:20s}: contribution={v:10.4f}  ({v/total:.1%} of total)")
                     print(f"  {'TOTAL':20s}: {total:.4f}")
                     print("=" * 60 + "\n")
-
-                if batch_idx == len(train_dataloader) - 1 and sample_idx == 0:
-                    nv_grad = torch.autograd.grad(loss_novel_view, means, retain_graph=True, allow_unused=True)[0]
-                    nv_grad_mag = nv_grad.abs().mean().item() if nv_grad is not None else 0.0
-
-                    with torch.no_grad():
-                        means_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=1)
-                        points_camB = (data["viewmats_B"][0] @ means_h.T).T
-                        Ks_B = data["Ks_B"]
-                        Z_MIN = 1.0
-                        valid_z = points_camB[:, 2] > Z_MIN
-                        Z_safe = points_camB[:, 2].clone()
-                        Z_safe[~valid_z] = 1.0
-                        x_proj = (points_camB[:, 0] / Z_safe) * Ks_B[0,0,0] + Ks_B[0,0,2]
-                        y_proj = (points_camB[:, 1] / Z_safe) * Ks_B[0,1,1] + Ks_B[0,1,2]
-                        in_frame = valid_z & (x_proj >= 0) & (x_proj <= 518) & (y_proj >= 0) & (y_proj <= 518)
-                        frac_offscreen = (~in_frame).float().mean().item()
-                    
-                    last_batch_metrics = (nv_grad_mag, frac_offscreen)
-
-                sample_loss = sum(weighted_terms.values())
-                
-                (sample_loss / args.batch_size).backward()
-                batch_total_loss += sample_loss.item() / args.batch_size
 
             optimizer.step()
             epoch_total_loss += batch_total_loss
