@@ -163,7 +163,11 @@ def compute_novel_view_loss(means, quats, scales, opacities, colors, viewmats_B,
     # 2. Pass RAW unmasked render to LPIPS with the ORIGINAL TIGHT mask.
     # LPIPS operates on deep feature maps which already have wide receptive fields;
     # blurring its inputs would corrupt the perceptual space.
-    loss_lpips_B = lpips_fn(pred_rgb_B_raw, gt_rgb_B, mask=mask_518_B)
+    # FIX: Check if lpips_fn is provided to cleanly support frozen-calibrator fine-tuning
+    if lpips_fn is not None:
+        loss_lpips_B = lpips_fn(pred_rgb_B_raw, gt_rgb_B, mask=mask_518_B)
+    else:
+        loss_lpips_B = torch.tensor(0.0, device=pred_rgb_B_raw.device)
     
     return loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B
 
