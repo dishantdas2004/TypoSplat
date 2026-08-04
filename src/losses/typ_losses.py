@@ -233,3 +233,15 @@ def compute_calibrator_regression_loss(calib_scale, calib_shift, target_opt_scal
     loss_shift = ((calib_shift.squeeze() - target_opt_shift) ** 2) / shift_denom
     
     return (loss_scale + loss_shift).mean()
+
+
+def compute_min_scale_loss(scales, tau_size=0.008):
+    """
+    Penalizes Gaussians whose smallest scale axis falls below tau_size,
+    preventing scale collapse toward degenerate near-zero primitives.
+    One-sided hinge penalty, following PrismGS (arXiv 2510.07830), Eq. 3.
+    Zero cost above threshold, linear cost below it.
+    """
+    min_axis = scales.min(dim=-1).values
+    penalty = torch.clamp(tau_size - min_axis, min=0.0)
+    return penalty.mean()

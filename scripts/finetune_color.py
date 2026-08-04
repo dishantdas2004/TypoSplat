@@ -1,9 +1,8 @@
 """
-TypoSplat Stage 1.5: Color Fine-Tuning
-======================================
-Short, bounded fine-tuning (5-8 epochs) to close the color gap.
-Freezes the calibrator, drops bootstrap geometric losses, and strictly optimizes RGB/Edge.
-Implements multiprocessing DataLoader and AMP (Automatic Mixed Precision).
+TypoSplat Stage 1.5: Color Fine-Tuning (Diagnostic Run)
+=======================================================
+Short diagnostic run (2 epochs) testing minimum-scale penalties to prevent
+scale collapse. Calibrator is frozen, bootstrap geometric losses dropped.
 """
 
 import os
@@ -42,6 +41,7 @@ from src.losses.typ_losses import (
     compute_extrusion_loss, 
     compute_normal_loss, 
     compute_novel_view_loss,
+    compute_min_scale_loss,
     _get_relative_viewmat
 )
 from src.data.mask_generator import get_letter_mask
@@ -57,7 +57,11 @@ WEIGHT_DEPTH = 20.0
 WEIGHT_EXTRUSION = 200.0   
 WEIGHT_NORMAL = 1.0        
 WEIGHT_LPIPS = 0.1         
-WEIGHT_NOVEL_VIEW = 6.0    # raised from 2.0 to close the A/B weighting gap
+WEIGHT_NOVEL_VIEW = 6.0    
+WEIGHT_MIN_SCALE = 500.0   # starting value; check iteration-0 audit contribution before trusting, target 5-15% of total loss
+
+# Matches diagnostic threshold for fraction near init (<0.008), not a physically-derived constant.
+TAU_SIZE = 0.008 
 
 # ==========================================
 # 1. Dataset & Two-Tier Cache Helpers
@@ -345,21 +349,35 @@ def compute_psnr_ssim(dataloader, upsampler, decoder, device, n_samples):
                         p_list[0], p_list[1], p_list[2], data["intrinsics_tuple_A"], device, mask_148=data["mask_148_A"]
                     )
                     
-                    # Target Novel View (Camera B) directly
+                    # Cast parameters explicitly to fp32 to protect the CUDA kernel from AMP format mismatches
                     r_colors_B, _, _ = rasterization(
-                        means=m, quats=q, scales=s, opacities=o, colors=c,
+                        means=m.float(), quats=q.float(), scales=s.float(), opacities=o.float(), colors=c.float(),
                         viewmats=data["viewmats_B"], Ks=data["Ks_B"], width=518, height=518,
                     )
                 
-                # Apply mask to pred and GT and format to uint8 numpy arrays [0, 255] 
-                pred_rgb = (r_colors_B.permute(0, 3, 1, 2) * data["mask_518_B"])[0].permute(1, 2, 0)
-                gt_rgb = (data["gt_rgb_B"] * data["mask_518_B"])[0].permute(1, 2, 0)
+                # Format to unmasked arrays first
+                pred_rgb = r_colors_B.permute(0, 3, 1, 2)[0].permute(1, 2, 0)
+                gt_rgb = data["gt_rgb_B"][0].permute(1, 2, 0)
                 
                 pred_np = (pred_rgb.detach().float().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
                 gt_np = (gt_rgb.detach().float().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                mask_np = data["mask_518_B"][0,0].detach().cpu().numpy().astype(bool)
+
+                # Letter-Region PSNR (flattened pixels only)
+                pred_masked_pixels = pred_np[mask_np]
+                gt_masked_pixels = gt_np[mask_np]
+                psnr_val = psnr_metric(gt_masked_pixels, pred_masked_pixels, data_range=255)
                 
-                psnr_val = psnr_metric(gt_np, pred_np, data_range=255)
-                ssim_val = ssim_metric(gt_np, pred_np, channel_axis=-1, data_range=255)
+                # Letter-Region Bounding Box SSIM (preserves spatial windows)
+                ys, xs = np.where(mask_np)
+                # Ensure the crop is at least 7x7 to prevent ValueError: win_size exceeds image extent
+                if len(ys) > 0 and len(xs) > 0 and (ys.max() - ys.min() + 1) >= 7 and (xs.max() - xs.min() + 1) >= 7:
+                    y0, y1, x0, x1 = ys.min(), ys.max()+1, xs.min(), xs.max()+1
+                    pred_crop = pred_np[y0:y1, x0:x1]
+                    gt_crop = gt_np[y0:y1, x0:x1]
+                    ssim_val = ssim_metric(gt_crop, pred_crop, channel_axis=-1, data_range=255)
+                else:
+                    ssim_val = 0.0 # Defensive fallback for severely degenerate/partial mask crops
                 
                 psnr_list.append(psnr_val)
                 ssim_list.append(ssim_val)
@@ -390,7 +408,7 @@ def main():
     parser.add_argument("--disk_backup_dir", type=str, default="/content/drive/MyDrive/TypoSplat/disk_cache_backup", help="Disk cache backup")
     parser.add_argument("--ram_backup_dir", type=str, default="/content/drive/MyDrive/TypoSplat/ram_cache_backup", help="Chunked RAM cache backup")
     parser.add_argument("--batch_size", type=int, default=16, help="Mini-batch size")
-    parser.add_argument("--num_epochs", type=int, default=6, help="Total training epochs (short fine-tune)")
+    parser.add_argument("--num_epochs", type=int, default=2, help="Total training epochs (short diagnostic run)")
     parser.add_argument("--num_workers", type=int, default=4, help="Multiprocessing workers for DataLoader")
     args = parser.parse_args()
 
@@ -502,7 +520,7 @@ def main():
         epoch_total_loss = 0.0
         
         # Track reduced loss components
-        epoch_component_losses = {k: 0.0 for k in ["rgb", "edge", "lpips", "depth", "extrusion", "normal", "novel_view"]}
+        epoch_component_losses = {k: 0.0 for k in ["rgb", "edge", "lpips", "depth", "extrusion", "normal", "novel_view", "min_scale"]}
         
         for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch}/{num_epochs}")):
             global_iter = (epoch - 1) * iters_per_epoch + batch_idx
@@ -523,9 +541,12 @@ def main():
                     means, quats, scales, opacities, colors = flatten_decoder_outputs_camera_space(
                         params_0, params_1, params_2, data["intrinsics_tuple_A"], device, mask_148=data["mask_148_A"]
                     )
+                    
+                    loss_min_scale = compute_min_scale_loss(scales, tau_size=TAU_SIZE)
 
+                    # Cast parameters explicitly to fp32 to protect the CUDA kernel from AMP format mismatches
                     render_colors_A, _, _ = rasterization(
-                        means=means, quats=quats, scales=scales, opacities=opacities, colors=colors,
+                        means=means.float(), quats=quats.float(), scales=scales.float(), opacities=opacities.float(), colors=colors.float(),
                         viewmats=data["viewmats_A"], Ks=data["Ks_A"], width=518, height=518,
                     )
                     pred_rgb_A_raw = render_colors_A.permute(0, 3, 1, 2)
@@ -541,8 +562,9 @@ def main():
                     loss_normal = compute_normal_loss(layer_1_depth, data["gt_depth_148_A"], data["intrinsics_dict_148_A"], data["mask_148_A"])
 
                     # Pass None for lpips_fn to bypass internal redundant/broken computation
+                    # Explicit fp32 casting protects the downstream rasterizer from AMP format errors
                     loss_rgb_B, loss_edge_B, _, render_colors_B = compute_novel_view_loss(
-                        means, quats, scales, opacities, colors, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], None, iteration=global_iter, warmup_iters=1
+                        means.float(), quats.float(), scales.float(), opacities.float(), colors.float(), data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], None, iteration=global_iter, warmup_iters=1
                     )
                     
                     # Compute Novel View LPIPS securely through the pre-masked wrapper
@@ -551,7 +573,7 @@ def main():
 
                     loss_novel_view_base = loss_rgb_B + loss_edge_B 
 
-                    # Real tensor loss for backpropagation (LPIPS_B weighted evenly with LPIPS_A)
+                    # Real tensor loss for backpropagation
                     sample_loss_tensor = (
                         WEIGHT_RGB * loss_rgb +
                         WEIGHT_EDGE * loss_edge +
@@ -560,7 +582,8 @@ def main():
                         WEIGHT_EXTRUSION * loss_extrusion +
                         WEIGHT_NORMAL * loss_normal +
                         WEIGHT_NOVEL_VIEW * loss_novel_view_base +
-                        WEIGHT_LPIPS * loss_lpips_B
+                        WEIGHT_LPIPS * loss_lpips_B +
+                        WEIGHT_MIN_SCALE * loss_min_scale
                     )
                 
                 # AMP scaled backward
@@ -576,6 +599,7 @@ def main():
                     "extrusion": WEIGHT_EXTRUSION * loss_extrusion.item(),
                     "normal": WEIGHT_NORMAL * loss_normal.item(),
                     "novel_view": WEIGHT_NOVEL_VIEW * loss_novel_view_base.item(),
+                    "min_scale": WEIGHT_MIN_SCALE * loss_min_scale.item(),
                 }
                 
                 for k, v in weighted_terms.items():
@@ -602,14 +626,14 @@ def main():
         comp_log_path = os.path.join(args.checkpoint_dir, "loss_components_log.csv")
         comp_write_header = not os.path.exists(comp_log_path)
         with open(comp_log_path, "a") as f:
-            headers = ["rgb", "edge", "lpips", "depth", "extrusion", "normal", "novel_view"]
+            headers = ["rgb", "edge", "lpips", "depth", "extrusion", "normal", "novel_view", "min_scale"]
             if comp_write_header:
                 f.write("epoch,global_iter,avg_epoch_loss," + ",".join(headers) + "\n")
             f.write(f"{epoch},{global_iter},{avg_epoch_loss:.6f}," + ",".join(f"{avg_components[k]:.6f}" for k in headers) + "\n")
-            print(f"[EPOCH {epoch}] Avg Loss: {avg_epoch_loss:.4f} | RGB: {avg_components['rgb']:.4f} | NV: {avg_components['novel_view']:.4f}")
+            print(f"[EPOCH {epoch}] Avg Loss: {avg_epoch_loss:.4f} | RGB: {avg_components['rgb']:.4f} | NV: {avg_components['novel_view']:.4f} | MinScale: {avg_components['min_scale']:.4f}")
 
         # --- Evaluate Post-Epoch PSNR / SSIM (Camera B) ---
-        eval_n = 350 if epoch == num_epochs else 25
+        eval_n = 350 # Evaluate all 350 samples every epoch
         print(f"\n--- Computing PSNR/SSIM (Epoch {epoch}, Camera B) ---")
         ep_psnr, ep_ssim = compute_psnr_ssim(eval_dataloader, upsampler, decoder, device, n_samples=eval_n)
         print(f"[EPOCH {epoch}] PSNR: {ep_psnr:.2f} | SSIM: {ep_ssim:.4f} (n={eval_n})")
@@ -634,13 +658,14 @@ def main():
                             p_list[0], p_list[1], p_list[2], data["intrinsics_tuple_A"], device, mask_148=data["mask_148_A"]
                         )
                         
+                        # Cast explicitly to float to avoid kernel crashes in autocast
                         r_colors_A, _, _ = rasterization(
-                            means=m, quats=q, scales=s, opacities=o, colors=c,
+                            means=m.float(), quats=q.float(), scales=s.float(), opacities=o.float(), colors=c.float(),
                             viewmats=data["viewmats_A"], Ks=data["Ks_A"], width=518, height=518,
                         )
                         
                         _, _, _, r_colors_B = compute_novel_view_loss(
-                            m, q, s, o, c, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], None, iteration=10000, warmup_iters=1
+                            m.float(), q.float(), s.float(), o.float(), c.float(), data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], None, iteration=10000, warmup_iters=1
                         )
                     
                     fig, axes = plt.subplots(2, 2, figsize=(10, 10))
