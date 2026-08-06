@@ -1,10 +1,10 @@
 """
-TypoSplat Stage 1.5: Color Fine-Tuning (Combined Fixes)
-=======================================================
-Short diagnostic run (5 epochs) incorporating all validated fixes:
-1. Leaky clamp activation for sh_dc (color) to prevent dead-gradient zones.
-2. Moderated photometric weights (RGB=4.0, NovelView=3.0) to balance color vs geometry.
-3. Minimum scale hinge penalty to cap geometric shrinkage.
+TypoSplat Stage 1.5: Color Fine-Tuning (Test B - Ablate Min-Scale)
+==================================================================
+Short diagnostic run (3 epochs) to isolate objective anti-correlation:
+1. WEIGHT_MIN_SCALE set to 0.0 (Ablated) to test if it was the driver of metric decline.
+2. Leaky clamp activation for sh_dc (color) preserved.
+3. Moderated photometric weights (RGB=4.0, NovelView=3.0) preserved.
 Calibrator remains frozen, bootstrap geometric losses dropped.
 """
 
@@ -61,7 +61,9 @@ WEIGHT_EXTRUSION = 200.0
 WEIGHT_NORMAL = 1.0        
 WEIGHT_LPIPS = 0.1         
 WEIGHT_NOVEL_VIEW = 3.0    
-WEIGHT_MIN_SCALE = 500.0   
+
+# [TEST B ABLATION]: Zeroed out the min_scale weight to test objective conflict
+WEIGHT_MIN_SCALE = 0.0   
 
 # Physically grounded threshold (2 * mean(depth/fx) across val set)
 TAU_SIZE = 0.006915 
@@ -316,12 +318,7 @@ def flatten_decoder_outputs_camera_space(params_0, params_1, params_2, intrinsic
         quats = params["rot"][0].permute(1, 2, 0).view(-1, 4)         
         scales = params["scale"][0].permute(1, 2, 0).view(-1, 3)      
         
-        # [FIX]: Replaced widened hard-clamp with a leaky clamp (slope 0.05).
-        # Reason: Direct measurement on the Stage 1 checkpoint showed the previous clamp-and-rescale
-        # activation ([-0.2, 1.2]) still left ~78-79% of raw sh_dc values outside its bounds 
-        # (measured range: min -4.86, max 2.69). This leaky-clamp guarantees a nonzero gradient 
-        # (slope 0.05) everywhere, so no weights are dead, while preserving full gradient inside [0,1].
-        # 0.05 is chosen over 0.01 to pull extreme outliers back within a short diagnostic run.
+        # Leaky clamp activation for sh_dc (slope 0.05) preserves gradient for out-of-bounds values
         x_raw = params["sh_dc"][0].permute(1, 2, 0).view(-1, 3)
         colors = torch.where(
             x_raw < 0.0,
@@ -417,11 +414,11 @@ def main():
     parser.add_argument("--data_dir", type=str, default="/content/data", help="Train dataset")
     parser.add_argument("--diag_csv", type=str, default="/content/master_diagnostics.csv", help="Master diagnostic CSV")
     parser.add_argument("--eval_data_dir", type=str, default=None, help="Eval dataset")
-    parser.add_argument("--checkpoint_dir", type=str, default="/content/drive/MyDrive/TypoSplat/stage1_5_leaky_clamp_fix", help="Output dir")
+    parser.add_argument("--checkpoint_dir", type=str, default="/content/drive/MyDrive/TypoSplat/stage1_5_ablate_min_scale", help="Output dir")
     parser.add_argument("--disk_backup_dir", type=str, default="/content/drive/MyDrive/TypoSplat/disk_cache_backup", help="Disk cache backup")
     parser.add_argument("--ram_backup_dir", type=str, default="/content/drive/MyDrive/TypoSplat/ram_cache_backup", help="Chunked RAM cache backup")
     parser.add_argument("--batch_size", type=int, default=16, help="Mini-batch size")
-    parser.add_argument("--num_epochs", type=int, default=5, help="Total training epochs")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Total training epochs")
     parser.add_argument("--num_workers", type=int, default=4, help="Multiprocessing workers for DataLoader")
     args = parser.parse_args()
 
