@@ -1,9 +1,9 @@
 """
 TypoSplat Stage 1 Full Training
 ===============================
-Epoch-based mini-batch training with Lazy Loading Two-Tier Dataset (Disk/RAM).
+Epoch-based mini-batch training.
 Supports separate evaluation datasets with automatic overlap checking.
-Includes Google Drive checkpoint and cache persistence, train-vs-val tracking,
+Includes Google Drive checkpoint persistence, train-vs-val tracking,
 and per-epoch loss component breakdowns.
 """
 
@@ -15,9 +15,9 @@ import shutil
 import random
 import argparse
 import uuid
-import concurrent.futures
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 import pandas as pd  
 import numpy as np
 import matplotlib.pyplot as plt
@@ -35,25 +35,22 @@ sys.path.append(root_dir)
 from src.models.vggt_wrapper import VGGTWrapper
 from src.models.upsampler import TypoSplatUpsampler
 from src.models.decoder import TypoSplatDecoder
-from src.losses.render_losses import compute_l1_rgb_loss, compute_sobel_edge_loss, ShallowPerceptualLoss
+from src.losses.render_losses import compute_l1_rgb_loss
 from src.losses.typ_losses import (
     compute_scale_invariant_depth_loss, 
     compute_extrusion_loss, 
     compute_normal_loss, 
     compute_anisotropy_loss,
-    compute_novel_view_loss,
     compute_centroid_loss,
     compute_zoffset_regularization,
     compute_opacity_sparsity_loss,
     compute_calibrator_regression_loss, 
     _get_relative_viewmat
 )
-from src.data.mask_generator import get_letter_mask
-from src.utils.cache_tier import get_cache_tier
 from gsplat import rasterization
 
 # ==========================================
-# 1. Dataset & Two-Tier Cache Helpers
+# 1. Dataset Helpers
 # ==========================================
 
 def load_exr_depth(filepath, device):
@@ -69,94 +66,11 @@ def load_exr_depth(filepath, device):
     depth_np = np.frombuffer(raw, dtype=np.float32).reshape(height, width)
     return torch.from_numpy(depth_np.copy()).unsqueeze(0).unsqueeze(0).to(device)
 
-def restore_disk_tier_from_drive(sample_dirs, drive_backup_root):
-    if not os.path.exists(drive_backup_root):
-        return
-
-    def _restore_single(sample_dir):
-        cache_path = os.path.join(sample_dir, "cached_features.pt")
-        if os.path.exists(cache_path):
-            return 0
-        sample_id = os.path.basename(sample_dir)
-        src = os.path.join(drive_backup_root, f"{sample_id}.pt")
-        if os.path.exists(src):
-            shutil.copy2(src, cache_path)
-            return 1
-        return 0
-
-    restored = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-        futures = {executor.submit(_restore_single, d): d for d in sample_dirs}
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(sample_dirs), desc="Restoring Disk Cache"):
-            try:
-                restored += future.result()
-            except Exception:
-                pass
-
-    if restored:
-        print(f"[INFO] Restored {restored} disk-tier cache files from Drive backup.")
-
-def build_or_load_ram_cache(all_sample_dirs, vggt, device, backup_dir, chunk_size=500):
-    ram_dirs = [d for d in all_sample_dirs if get_cache_tier(int(os.path.basename(d))) == "ram"]
-    ram_cache = {}
-
-    if os.path.exists(backup_dir) and os.path.isdir(backup_dir):
-        chunk_files = glob.glob(os.path.join(backup_dir, "*.pt"))
-        if chunk_files:
-            print(f"Loading {len(chunk_files)} RAM-tier chunks from Drive backup...")
-            for cf in tqdm(chunk_files, desc="Loading RAM chunks"):
-                try:
-                    chunk_data = torch.load(cf, map_location='cpu')
-                    ram_cache.update(chunk_data)
-                except Exception as e:
-                    print(f"Warning: Failed to load chunk {cf} ({e}). It will be recomputed.")
-
-    missing_dirs = [d for d in ram_dirs if int(os.path.basename(d)) not in ram_cache]
-
-    if missing_dirs:
-        print(f"Computing {len(missing_dirs)} missing RAM-tier samples in chunks of {chunk_size}...")
-        vggt.eval()
-        os.makedirs(backup_dir, exist_ok=True)
-
-        for i in range(0, len(missing_dirs), chunk_size):
-            chunk_dirs = missing_dirs[i:i + chunk_size]
-            chunk_dict = {}
-            chunk_idx = (i // chunk_size) + 1
-            total_chunks = (len(missing_dirs) + chunk_size - 1) // chunk_size
-
-            for d in tqdm(chunk_dirs, desc=f"RAM-tier preload (Chunk {chunk_idx}/{total_chunks})"):
-                sample_id = int(os.path.basename(d))
-                meta_path = os.path.join(d, "metadata.json")
-                mesh_path = os.path.join(d, "mesh.ply")
-                with open(meta_path, 'r') as f:
-                    meta = json.load(f)
-                view_A_paths = glob.glob(os.path.join(d, "*view_A*.png"))
-                gt_rgb_A = transforms.ToTensor()(Image.open(view_A_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    vggt_out = vggt.forward_with_features(gt_rgb_A)
-                mask_148_A = get_letter_mask(mesh_path, meta, device=device)
-                mask_148_B = get_letter_mask(mesh_path, meta["camera_B"], device=device)
-
-                chunk_dict[sample_id] = {
-                    "patch_tokens": vggt_out["patch_tokens"].cpu().half(),
-                    "base_depth": vggt_out["depth"].cpu().half(),
-                    "mask_148_A": mask_148_A.cpu().half(),
-                    "mask_148_B": mask_148_B.cpu().half(),
-                }
-
-            chunk_id = uuid.uuid4().hex[:8]
-            chunk_path = os.path.join(backup_dir, f"ram_chunk_{chunk_id}.pt")
-            torch.save(chunk_dict, chunk_path)
-            ram_cache.update(chunk_dict)
-
-    return ram_cache
 
 class TypoSplatDataset(Dataset):
-    def __init__(self, sample_dirs, diagnostic_df, ram_cache, vggt, device):
+    def __init__(self, sample_dirs, diagnostic_df, vggt, device):
         self.sample_dirs = sample_dirs
         self.diagnostic_df = diagnostic_df
-        self.ram_cache = ram_cache
         self.vggt = vggt
         self.device = device
 
@@ -166,62 +80,51 @@ class TypoSplatDataset(Dataset):
     def __getitem__(self, idx):
         sample_dir = self.sample_dirs[idx]
         sample_id = int(os.path.basename(sample_dir))
-        tier = get_cache_tier(sample_id)
         
         target_opt_scale = float(self.diagnostic_df.loc[sample_id, "Opt_Scale"])
         target_opt_shift = float(self.diagnostic_df.loc[sample_id, "Opt_Shift"])
 
         meta_path = os.path.join(sample_dir, "metadata.json")
-        mesh_path = os.path.join(sample_dir, "mesh.ply")
         with open(meta_path, 'r') as f:
             meta = json.load(f)
 
         view_A_paths = glob.glob(os.path.join(sample_dir, "*view_A*.png"))
         view_B_paths = glob.glob(os.path.join(sample_dir, "*view_B*.png"))
+        view_C_paths = glob.glob(os.path.join(sample_dir, "*view_C*.png"))
+        view_D_paths = glob.glob(os.path.join(sample_dir, "*view_D*.png"))
         depth_A_paths = glob.glob(os.path.join(sample_dir, "*depth_A*.exr"))
         
-        if tier == "ram":
-            cached_data = self.ram_cache[sample_id]
-        else:
-            cache_path = os.path.join(sample_dir, "cached_features.pt")
-            try:
-                if not os.path.exists(cache_path):
-                    raise FileNotFoundError("Cache missing.")
-                cached_data = torch.load(cache_path, map_location='cpu')
-                if not all(k in cached_data for k in ("patch_tokens", "base_depth", "mask_148_A", "mask_148_B")):
-                    raise ValueError("Incomplete cache data.")
-            except Exception:
-                # On-the-fly self-healing
-                gt_rgb_A = transforms.ToTensor()(Image.open(view_A_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    vggt_out = self.vggt.forward_with_features(gt_rgb_A)
-                mask_148_A = get_letter_mask(mesh_path, meta, device=self.device)
-                mask_148_B = get_letter_mask(mesh_path, meta["camera_B"], device=self.device)
-                
-                cached_data = {
-                    "patch_tokens": vggt_out["patch_tokens"].cpu().half(),
-                    "base_depth": vggt_out["depth"].cpu().half(),
-                    "mask_148_A": mask_148_A.cpu().half(),
-                    "mask_148_B": mask_148_B.cpu().half()
-                }
-                try:
-                    torch.save(cached_data, cache_path)
-                except Exception:
-                    pass
+        cache_path = os.path.join(sample_dir, "cached_features.pt")
+        try:
+            if not os.path.exists(cache_path):
+                raise FileNotFoundError("Cache file missing.")
+            cached_data = torch.load(cache_path, map_location='cpu')
+            expected_keys = ("patch_tokens", "base_depth", "mask_148_A", "mask_148_B", "mask_148_C", "mask_148_D")
+            if not all(k in cached_data for k in expected_keys):
+                raise ValueError("Incomplete cache data keys.")
+        except Exception as e:
+            raise RuntimeError(f"Cache missing/corrupt for {sample_dir}. Run the precompute script first. Details: {e}")
         
         # Upcast to FP32 and transfer to target GPU device
         patch_tokens = cached_data["patch_tokens"].float().to(self.device)
         base_depth = cached_data["base_depth"].float().to(self.device)
         mask_148_A = cached_data["mask_148_A"].float().to(self.device)
         mask_148_B = cached_data["mask_148_B"].float().to(self.device)
+        mask_148_C = cached_data["mask_148_C"].float().to(self.device)
+        mask_148_D = cached_data["mask_148_D"].float().to(self.device)
 
         mask_518_A = torch.nn.functional.interpolate(mask_148_A, size=(518, 518), mode='nearest')
         mask_518_B = torch.nn.functional.interpolate(mask_148_B, size=(518, 518), mode='nearest')
+        mask_518_C = torch.nn.functional.interpolate(mask_148_C, size=(518, 518), mode='nearest')
+        mask_518_D = torch.nn.functional.interpolate(mask_148_D, size=(518, 518), mode='nearest')
 
         gt_rgb_A = transforms.ToTensor()(Image.open(view_A_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(self.device)
         gt_depth_518_A = load_exr_depth(depth_A_paths[0], self.device)
         gt_depth_148_A = torch.nn.functional.interpolate(gt_depth_518_A, size=(148, 148), mode='nearest')
+        
         gt_rgb_B = transforms.ToTensor()(Image.open(view_B_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(self.device)
+        gt_rgb_C = transforms.ToTensor()(Image.open(view_C_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(self.device)
+        gt_rgb_D = transforms.ToTensor()(Image.open(view_D_paths[0]).convert("RGB").resize((518, 518))).unsqueeze(0).to(self.device)
 
         intrinsics_tuple_A = (meta["fx"], meta["fy"], meta["cx"], meta["cy"])
         scale_148 = 148.0 / 518.0
@@ -235,6 +138,14 @@ class TypoSplatDataset(Dataset):
         meta_B = meta["camera_B"]
         Ks_B = torch.tensor([[[meta_B["fx"], 0, meta_B["cx"]], [0, meta_B["fy"], meta_B["cy"]], [0, 0, 1]]], dtype=torch.float32, device=self.device)
         viewmats_B = _get_relative_viewmat(meta["camera_to_world_matrix"], meta_B["camera_to_world_matrix"], self.device)
+        
+        meta_C = meta["camera_C"]
+        Ks_C = torch.tensor([[[meta_C["fx"], 0, meta_C["cx"]], [0, meta_C["fy"], meta_C["cy"]], [0, 0, 1]]], dtype=torch.float32, device=self.device)
+        viewmats_C = _get_relative_viewmat(meta["camera_to_world_matrix"], meta_C["camera_to_world_matrix"], self.device)
+        
+        meta_D = meta["camera_D"]
+        Ks_D = torch.tensor([[[meta_D["fx"], 0, meta_D["cx"]], [0, meta_D["fy"], meta_D["cy"]], [0, 0, 1]]], dtype=torch.float32, device=self.device)
+        viewmats_D = _get_relative_viewmat(meta["camera_to_world_matrix"], meta_D["camera_to_world_matrix"], self.device)
 
         return {
             "dir": sample_dir,
@@ -242,15 +153,23 @@ class TypoSplatDataset(Dataset):
             "gt_rgb_A": gt_rgb_A,
             "gt_depth_148_A": gt_depth_148_A,
             "gt_rgb_B": gt_rgb_B,
+            "gt_rgb_C": gt_rgb_C,
+            "gt_rgb_D": gt_rgb_D,
             "mask_148_A": mask_148_A,
             "mask_518_A": mask_518_A,
             "mask_518_B": mask_518_B,
+            "mask_518_C": mask_518_C,
+            "mask_518_D": mask_518_D,
             "intrinsics_tuple_A": intrinsics_tuple_A,
             "intrinsics_dict_148_A": intrinsics_dict_148_A,
             "Ks_A": Ks_A,
             "viewmats_A": viewmats_A,
             "Ks_B": Ks_B,
             "viewmats_B": viewmats_B,
+            "Ks_C": Ks_C,
+            "viewmats_C": viewmats_C,
+            "Ks_D": Ks_D,
+            "viewmats_D": viewmats_D,
             "patch_tokens": patch_tokens,
             "base_depth": base_depth,
             "target_opt_scale": target_opt_scale,
@@ -258,7 +177,52 @@ class TypoSplatDataset(Dataset):
         }
 
 # ==========================================
-# 2. Helpers (Flatten & Evaluate)
+# 2. Additions (SSIM, Scale Penalty, Act)
+# ==========================================
+
+GAIN, BIAS, LEAK = 1.0, 0.72, 0.2
+def function_preserving_activation(raw):
+    x = GAIN * raw + BIAS
+    return (LEAK * x + (1.0 - LEAK) * x.clamp(-2.0, 2.0)) / 4.0 + 0.5
+
+def gaussian_window(window_size, sigma):
+    coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+    g = torch.exp(-(coords**2) / (2 * sigma**2))
+    g /= g.sum()
+    return g.view(1, -1) * g.view(-1, 1)
+
+def dycheck_ssim(x, y, mask, window_size=7, sigma=1.5, cov_thresh=0.3):
+    C = x.shape[1]
+    w = gaussian_window(window_size, sigma).to(x.device).expand(C, 1, window_size, window_size)
+    M = mask.float().expand(-1, C, -1, -1)
+    
+    def conv(t):
+        return F.conv2d(t, w, padding=window_size // 2, groups=C)
+        
+    den = conv(M) + 1e-8
+    mu_x, mu_y = conv(M * x) / den, conv(M * y) / den
+    s_xx = conv(M * x * x) / den - mu_x**2
+    s_yy = conv(M * y * y) / den - mu_y**2
+    s_xy = conv(M * x * y) / den - mu_x * mu_y
+    
+    C1, C2 = 0.01**2, 0.03**2
+    ssim_map = ((2*mu_x*mu_y + C1) * (2*s_xy + C2)) / ((mu_x**2 + mu_y**2 + C1) * (s_xx + s_yy + C2))
+    
+    coverage = conv(M)
+    valid = (M > 0) & (coverage >= cov_thresh)
+    ssim_map_masked = ssim_map[valid]
+    
+    if ssim_map_masked.numel() == 0:
+        return torch.tensor(0.0).to(x.device), 0.0
+    return ssim_map_masked.mean(), valid.sum().float() / (M > 0).sum().float()
+
+def compute_scale_magnitude_penalty(scale, clamp_bound=0.06, target_fraction=0.3):
+    target = clamp_bound * target_fraction
+    return F.relu(scale - target).mean()
+
+
+# ==========================================
+# 3. Helpers (Flatten & Evaluate)
 # ==========================================
 
 def flatten_decoder_outputs_camera_space(params_0, params_1, params_2, intrinsics, device, mask_148=None, H_out=518, H_in=148):
@@ -280,7 +244,9 @@ def flatten_decoder_outputs_camera_space(params_0, params_1, params_2, intrinsic
         means = torch.stack([X, Y, Z], dim=-1).view(-1, 3) 
         quats = params["rot"][0].permute(1, 2, 0).view(-1, 4)         
         scales = params["scale"][0].permute(1, 2, 0).view(-1, 3)      
-        colors = torch.sigmoid(params["sh_dc"][0].permute(1, 2, 0).view(-1, 3))      
+        
+        raw_sh_dc = params["sh_dc"][0].permute(1, 2, 0).view(-1, 3)
+        colors = function_preserving_activation(raw_sh_dc)
 
         opacities = params["opacity"][0].view(-1)
         if flat_mask is not None:
@@ -297,19 +263,35 @@ def flatten_decoder_outputs_camera_space(params_0, params_1, params_2, intrinsic
 def evaluate(dataloader, upsampler, decoder, device):
     upsampler.eval()
     decoder.eval()
-    scale_errors, shift_errors, per_sample_results = [], [], []
+    scale_errors, shift_errors, novel_ssims, per_sample_results = [], [], [], []
     
     with torch.no_grad():
         for batch in dataloader:
             for data in batch:
                 upsampled_features = upsampler(data["patch_tokens"])
-                _, calib_scale, calib_shift, _, attn_weights = decoder(upsampled_features, data["base_depth"], data["patch_tokens"])
+                params_list, calib_scale, calib_shift, _, attn_weights = decoder(upsampled_features, data["base_depth"], data["patch_tokens"])
                 
                 pred_scale = calib_scale.item()
                 pred_shift = calib_shift.item()
                 
                 scale_errors.append(abs(pred_scale - data["target_opt_scale"]))
                 shift_errors.append(abs(pred_shift - data["target_opt_shift"]))
+                
+                m, q, s, o, c = flatten_decoder_outputs_camera_space(
+                    params_list[0], params_list[1], params_list[2], data["intrinsics_tuple_A"], device, mask_148=data["mask_148_A"]
+                )
+                
+                sample_ssims = []
+                for view in ['B', 'C', 'D']:
+                    r_colors, _, _ = rasterization(
+                        means=m, quats=q, scales=s, opacities=o, colors=c,
+                        viewmats=data[f"viewmats_{view}"], Ks=data[f"Ks_{view}"], width=518, height=518
+                    )
+                    pred_raw = r_colors.permute(0, 3, 1, 2)
+                    ssim_val, _ = dycheck_ssim(pred_raw, data[f"gt_rgb_{view}"], data[f"mask_518_{view}"], window_size=7, cov_thresh=0.3)
+                    sample_ssims.append(ssim_val.item())
+                    
+                novel_ssims.append(sum(sample_ssims) / 3.0)
                 
                 per_sample_results.append({
                     "sample": os.path.basename(data["dir"]),
@@ -324,12 +306,13 @@ def evaluate(dataloader, upsampler, decoder, device):
     upsampler.train()
     decoder.train()
     
-    mean_scale_err = sum(scale_errors) / len(scale_errors)
-    mean_shift_err = sum(shift_errors) / len(shift_errors)
-    return mean_scale_err, mean_shift_err, per_sample_results
+    mean_scale_err = sum(scale_errors) / len(scale_errors) if scale_errors else 0.0
+    mean_shift_err = sum(shift_errors) / len(shift_errors) if shift_errors else 0.0
+    mean_novel_ssim = sum(novel_ssims) / len(novel_ssims) if novel_ssims else 0.0
+    return mean_scale_err, mean_shift_err, mean_novel_ssim, per_sample_results
 
 # ==========================================
-# 3. Main Training Script
+# 4. Main Training Script
 # ==========================================
 
 def main():
@@ -341,8 +324,6 @@ def main():
     parser.add_argument("--diag_csv", type=str, default="/content/master_diagnostics.csv", help="Path to single master diagnostic CSV")
     parser.add_argument("--eval_data_dir", type=str, default=None, help="Directory containing separate eval sample folders (REQUIRED for true validation)")
     parser.add_argument("--checkpoint_dir", type=str, default="/content/drive/MyDrive/TypoSplat/stage1_checkpoints", help="Persistent storage directory on Google Drive")
-    parser.add_argument("--disk_backup_dir", type=str, default="/content/drive/MyDrive/TypoSplat/disk_cache_backup", help="Path to disk cache backup on Drive")
-    parser.add_argument("--ram_backup_dir", type=str, default="/content/drive/MyDrive/TypoSplat/ram_cache_backup", help="Directory for chunked RAM cache backups on Drive")
     parser.add_argument("--batch_size", type=int, default=16, help="Mini-batch size")
     parser.add_argument("--num_epochs", type=int, default=30, help="Total training epochs")
     args = parser.parse_args()
@@ -391,32 +372,23 @@ def main():
     if len(eval_dirs) != 350:
         print(f"[WARNING] Eval pool size ({len(eval_dirs)}) does not match expected 350 — check --eval_data_dir.")
 
-    all_sample_dirs = train_dirs + eval_dirs
-
-    # --- Disk Tier Restore ---
-    restore_disk_tier_from_drive(all_sample_dirs, args.disk_backup_dir)
-
-    # --- Global CPU RAM Cache Preload ---
-    global_ram_cache = build_or_load_ram_cache(all_sample_dirs, vggt, device, args.ram_backup_dir)
-
     # --- Construct Datasets ---
-    train_dataset = TypoSplatDataset(train_dirs, master_diag_df, global_ram_cache, vggt, device)
-    eval_dataset = TypoSplatDataset(eval_dirs, master_diag_df, global_ram_cache, vggt, device)
+    train_dataset = TypoSplatDataset(train_dirs, master_diag_df, vggt, device)
+    eval_dataset = TypoSplatDataset(eval_dirs, master_diag_df, vggt, device)
     
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: x)
     eval_dataloader = DataLoader(eval_dataset, batch_size=16, shuffle=False, collate_fn=lambda x: x)
 
     fixed_train_eval_dirs = train_dirs[:50]
-    fixed_train_eval_dataset = TypoSplatDataset(fixed_train_eval_dirs, master_diag_df, global_ram_cache, vggt, device)
+    fixed_train_eval_dataset = TypoSplatDataset(fixed_train_eval_dirs, master_diag_df, vggt, device)
     fixed_train_eval_dataloader = DataLoader(fixed_train_eval_dataset, batch_size=16, shuffle=False, collate_fn=lambda x: x)
     
     fixed_vis_dirs = train_dirs[:2]
-    fixed_vis_dataset = TypoSplatDataset(fixed_vis_dirs, master_diag_df, global_ram_cache, vggt, device)
+    fixed_vis_dataset = TypoSplatDataset(fixed_vis_dirs, master_diag_df, vggt, device)
     fixed_vis_dataloader = DataLoader(fixed_vis_dataset, batch_size=1, shuffle=False, collate_fn=lambda x: x)
 
     upsampler = TypoSplatUpsampler(in_channels=2048, out_channels=256).to(device)
     decoder = TypoSplatDecoder(in_channels=258).to(device)
-    lpips_fn = ShallowPerceptualLoss(device)
 
     calibrator_params = list(decoder.calibrator.parameters())
     base_params = list(upsampler.parameters()) + [p for n, p in decoder.named_parameters() if 'calibrator' not in n]
@@ -430,6 +402,9 @@ def main():
     iters_per_epoch = len(train_dataset) // args.batch_size
     bootstrap_iters = int(iters_per_epoch * 4.0)
     anneal_iters = int(iters_per_epoch * 4.0)
+    
+    W_SSIM_MAX = 0.2
+    W_SCALE_MAG = 1.0
 
     start_epoch = 1
     global_iter = 0
@@ -464,7 +439,7 @@ def main():
         
         # Initialize component loss tracking for this epoch
         epoch_component_losses = {k: 0.0 for k in [
-            "rgb", "edge", "lpips", "depth", "extrusion", "aniso", 
+            "rgb", "ssim", "depth", "extrusion", "aniso", "scale_mag",
             "normal", "novel_view", "centroid", "zreg", "opacity_sparsity", "calib_reg"
         ]}
         
@@ -479,6 +454,8 @@ def main():
 
             optimizer.zero_grad()
             batch_total_loss = 0.0
+            
+            ssim_weight = W_SSIM_MAX * min(1.0, global_iter / bootstrap_iters)
 
             for sample_idx, data in enumerate(batch):
                 upsampled_features = upsampler(data["patch_tokens"])
@@ -497,22 +474,47 @@ def main():
                 pred_rgb_A_raw = render_colors_A.permute(0, 3, 1, 2)
                 pred_rgb_A_masked = pred_rgb_A_raw * data["mask_518_A"]
 
-                loss_rgb = compute_l1_rgb_loss(pred_rgb_A_masked, data["gt_rgb_A"], mask=data["mask_518_A"])
-                loss_edge = compute_sobel_edge_loss(pred_rgb_A_masked, data["gt_rgb_A"], mask=data["mask_518_A"])
-                loss_lpips = lpips_fn(pred_rgb_A_raw, data["gt_rgb_A"], mask=data["mask_518_A"])
+                loss_rgb_A = compute_l1_rgb_loss(pred_rgb_A_masked, data["gt_rgb_A"], mask=data["mask_518_A"])
+                M_loss_A = F.max_pool2d(data["mask_518_A"].float(), kernel_size=11, stride=1, padding=5)
+                ssim_A, _ = dycheck_ssim(pred_rgb_A_raw, data["gt_rgb_A"], M_loss_A, window_size=7, cov_thresh=0.5)
 
                 layer_1_depth = params_0["true_depth"] + params_1["z_offset"]
                 loss_depth = compute_scale_invariant_depth_loss(layer_1_depth, data["gt_depth_148_A"], data["mask_148_A"].bool())
                 loss_extrusion = compute_extrusion_loss(params_1, params_2, data["meta"]["extrusion_depth"], data["mask_148_A"])
-                loss_aniso = compute_anisotropy_loss(scales, r_bound=10.0)
                 loss_normal = compute_normal_loss(layer_1_depth, data["gt_depth_148_A"], data["intrinsics_dict_148_A"], data["mask_148_A"])
 
-                loss_rgb_B, loss_edge_B, loss_lpips_B, render_colors_B = compute_novel_view_loss(
-                    means, quats, scales, opacities, colors, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], lpips_fn, iteration=global_iter, warmup_iters=bootstrap_iters
-                )
+                loss_rgb_novel = 0.0
+                loss_ssim_novel = 0.0
+                loss_centroid = 0.0
+                
+                for view in ['B', 'C', 'D']:
+                    r_colors_v, _, _ = rasterization(
+                        means=means, quats=quats, scales=scales, opacities=opacities, colors=colors,
+                        viewmats=data[f"viewmats_{view}"], Ks=data[f"Ks_{view}"], width=518, height=518,
+                    )
+                    pred_raw_v = r_colors_v.permute(0, 3, 1, 2)
+                    pred_masked_v = pred_raw_v * data[f"mask_518_{view}"]
+                    
+                    l1_v = compute_l1_rgb_loss(pred_masked_v, data[f"gt_rgb_{view}"], mask=data[f"mask_518_{view}"])
+                    M_loss_v = F.max_pool2d(data[f"mask_518_{view}"].float(), kernel_size=11, stride=1, padding=5)
+                    ssim_v, _ = dycheck_ssim(pred_raw_v, data[f"gt_rgb_{view}"], M_loss_v, window_size=7, cov_thresh=0.5)
+                    cent_v = compute_centroid_loss(means, data[f"viewmats_{view}"], data[f"Ks_{view}"], data[f"mask_518_{view}"], device)
+                    
+                    loss_rgb_novel += l1_v
+                    loss_ssim_novel += (1.0 - ssim_v)
+                    loss_centroid += cent_v
 
-                loss_novel_view = loss_rgb_B + loss_edge_B + (0.002 * loss_lpips_B)
-                loss_centroid = compute_centroid_loss(means, data["viewmats_B"], data["Ks_B"], data["mask_518_B"], device)
+                loss_rgb_novel /= 3.0
+                loss_ssim_novel /= 3.0
+                loss_centroid /= 3.0
+
+                flat_mask_bool = data["mask_148_A"][0, 0].bool().view(-1)
+                full_mask = torch.cat([flat_mask_bool]*3, dim=0)
+                valid_scales = scales[full_mask]
+                
+                loss_aniso = compute_anisotropy_loss(valid_scales, r_bound=10.0)
+                loss_scale_mag = compute_scale_magnitude_penalty(valid_scales)
+                
                 loss_zreg = compute_zoffset_regularization(params_1, params_2)
                 loss_opacity_sparsity = compute_opacity_sparsity_loss(opacities)
 
@@ -526,7 +528,8 @@ def main():
                 )
 
                 if batch_idx == len(train_dataloader) - 1 and sample_idx == 0:
-                    nv_grad = torch.autograd.grad(loss_novel_view, means, retain_graph=True, allow_unused=True)[0]
+                    L_novel_for_grad = loss_rgb_novel + ssim_weight * loss_ssim_novel
+                    nv_grad = torch.autograd.grad(L_novel_for_grad, means, retain_graph=True, allow_unused=True)[0]
                     nv_grad_mag = nv_grad.abs().mean().item() if nv_grad is not None else 0.0
 
                     with torch.no_grad():
@@ -546,14 +549,15 @@ def main():
 
                 # Real tensor loss for backpropagation
                 sample_loss_tensor = (
-                    1.0 * loss_rgb +
-                    1.0 * loss_edge +
-                    0.002 * loss_lpips +
+                    1.0 * loss_rgb_A +
+                    1.0 * loss_rgb_novel +
+                    ssim_weight * (1.0 - ssim_A) +
+                    ssim_weight * loss_ssim_novel +
                     50.0 * loss_depth +
                     1000.0 * loss_extrusion +
                     1.0 * loss_aniso +
+                    W_SCALE_MAG * loss_scale_mag +
                     1.0 * loss_normal +
-                    0.5 * loss_novel_view +
                     (centroid_weight * 0.05 * loss_centroid) +
                     0.05 * loss_zreg +
                     1.0 * loss_opacity_sparsity +
@@ -565,14 +569,14 @@ def main():
 
                 # Item-based dictionary strictly for logging
                 weighted_terms = {
-                    "rgb": 1.0 * loss_rgb.item(),
-                    "edge": 1.0 * loss_edge.item(),
-                    "lpips": 0.002 * loss_lpips.item(),
+                    "rgb": 1.0 * loss_rgb_A.item(),
+                    "ssim": ssim_weight * (1.0 - ssim_A).item(),
+                    "novel_view": 1.0 * loss_rgb_novel.item() + ssim_weight * loss_ssim_novel.item(),
                     "depth": 50.0 * loss_depth.item(),
                     "extrusion": 1000.0 * loss_extrusion.item(),
                     "aniso": 1.0 * loss_aniso.item(),
+                    "scale_mag": W_SCALE_MAG * loss_scale_mag.item(),
                     "normal": 1.0 * loss_normal.item(),
-                    "novel_view": 0.5 * loss_novel_view.item(),
                     "centroid": centroid_weight * 0.05 * loss_centroid.item(),
                     "zreg": 0.05 * loss_zreg.item(),
                     "opacity_sparsity": 1.0 * loss_opacity_sparsity.item(),
@@ -607,7 +611,7 @@ def main():
         comp_log_path = os.path.join(args.checkpoint_dir, "loss_components_log.csv")
         comp_write_header = not os.path.exists(comp_log_path)
         with open(comp_log_path, "a") as f:
-            headers = ["rgb", "edge", "lpips", "depth", "extrusion", "aniso", "normal", "novel_view", "centroid", "zreg", "opacity_sparsity", "calib_reg"]
+            headers = ["rgb", "ssim", "depth", "extrusion", "aniso", "scale_mag", "normal", "novel_view", "centroid", "zreg", "opacity_sparsity", "calib_reg"]
             if comp_write_header:
                 f.write("epoch,global_iter," + ",".join(headers) + "\n")
             f.write(f"{epoch},{global_iter}," + ",".join(f"{avg_components[k]:.6f}" for k in headers) + "\n")
@@ -627,28 +631,38 @@ def main():
                         p_list[0], p_list[1], p_list[2], data["intrinsics_tuple_A"], device, mask_148=data["mask_148_A"]
                     )
                     
-                    r_colors_A, _, _ = rasterization(
-                        means=m, quats=q, scales=s, opacities=o, colors=c,
-                        viewmats=data["viewmats_A"], Ks=data["Ks_A"], width=518, height=518,
-                    )
+                    r_colors_A, _, _ = rasterization(means=m, quats=q, scales=s, opacities=o, colors=c, viewmats=data["viewmats_A"], Ks=data["Ks_A"], width=518, height=518)
+                    r_colors_B, _, _ = rasterization(means=m, quats=q, scales=s, opacities=o, colors=c, viewmats=data["viewmats_B"], Ks=data["Ks_B"], width=518, height=518)
+                    r_colors_C, _, _ = rasterization(means=m, quats=q, scales=s, opacities=o, colors=c, viewmats=data["viewmats_C"], Ks=data["Ks_C"], width=518, height=518)
+                    r_colors_D, _, _ = rasterization(means=m, quats=q, scales=s, opacities=o, colors=c, viewmats=data["viewmats_D"], Ks=data["Ks_D"], width=518, height=518)
                     
-                    _, _, _, r_colors_B = compute_novel_view_loss(
-                        m, q, s, o, c, data["viewmats_B"], data["Ks_B"], data["gt_rgb_B"], data["mask_518_B"], lpips_fn, iteration=10000, warmup_iters=1
-                    )
+                    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
                     
-                    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
-                    axes[0,0].imshow(data["gt_rgb_A"][0].permute(1, 2, 0).cpu().numpy() * data["mask_518_A"][0].permute(1, 2, 0).cpu().numpy())
-                    axes[0,0].set_title("GT Camera A")
-                    axes[0,1].imshow((r_colors_A.permute(0,3,1,2) * data["mask_518_A"])[0].permute(1,2,0).detach().cpu().numpy())
-                    axes[0,1].set_title(f"Render A (Epoch {epoch})")
-                    axes[1,0].imshow(data["gt_rgb_B"][0].permute(1, 2, 0).cpu().numpy() * data["mask_518_B"][0].permute(1, 2, 0).cpu().numpy())
-                    axes[1,0].set_title("GT Camera B")
-                    axes[1,1].imshow((r_colors_B.permute(0,3,1,2) * data["mask_518_B"])[0].permute(1,2,0).detach().cpu().numpy())
-                    axes[1,1].set_title(f"Render B (Epoch {epoch})")
+                    for i, view in enumerate(['A', 'B', 'C', 'D']):
+                        mask_v = data[f"mask_518_{view}"][0].permute(1, 2, 0).cpu().numpy()
+                        gt_v = data[f"gt_rgb_{view}"][0].permute(1, 2, 0).cpu().numpy() * mask_v
+                        if view == 'A':
+                            r_v = (r_colors_A.permute(0,3,1,2) * data[f"mask_518_{view}"])[0].permute(1,2,0).detach().cpu().numpy()
+                        elif view == 'B':
+                            r_v = (r_colors_B.permute(0,3,1,2) * data[f"mask_518_{view}"])[0].permute(1,2,0).detach().cpu().numpy()
+                        elif view == 'C':
+                            r_v = (r_colors_C.permute(0,3,1,2) * data[f"mask_518_{view}"])[0].permute(1,2,0).detach().cpu().numpy()
+                        else:
+                            r_v = (r_colors_D.permute(0,3,1,2) * data[f"mask_518_{view}"])[0].permute(1,2,0).detach().cpu().numpy()
+                            
+                        axes[0, i].imshow(gt_v)
+                        axes[0, i].set_title(f"GT Camera {view}")
+                        axes[0, i].axis('off')
+                        
+                        axes[1, i].imshow(r_v.clip(0, 1))
+                        axes[1, i].set_title(f"Render {view} (Epoch {epoch})")
+                        axes[1, i].axis('off')
                     
+                    plt.tight_layout()
                     plt.savefig(os.path.join(args.checkpoint_dir, f"{sample_name}_render_ep{epoch}.png"), dpi=150)
                     plt.close(fig)
 
+                    # Attention visualization
                     fig_attn, ax_attn = plt.subplots(figsize=(5, 5))
                     im = ax_attn.imshow(attn_w[0, 0].view(37, 37).cpu().numpy(), cmap='viridis')
                     ax_attn.set_title(f"Attention (Epoch {epoch})")
@@ -670,11 +684,11 @@ def main():
         }, checkpoint_path)
         
         # --- Evaluate ---
-        val_scale_err, val_shift_err, val_per_sample = evaluate(eval_dataloader, upsampler, decoder, device)
-        train_scale_err, train_shift_err, _ = evaluate(fixed_train_eval_dataloader, upsampler, decoder, device)
+        val_scale_err, val_shift_err, val_novel_ssim, val_per_sample = evaluate(eval_dataloader, upsampler, decoder, device)
+        train_scale_err, train_shift_err, train_novel_ssim, _ = evaluate(fixed_train_eval_dataloader, upsampler, decoder, device)
         
-        print(f"\n[EPOCH {epoch} EVAL] Val ScaleErr: {val_scale_err:.4f} | Val ShiftErr: {val_shift_err:.4f}")
-        print(f"                 Train ScaleErr: {train_scale_err:.4f} | Train ShiftErr: {train_shift_err:.4f}")
+        print(f"\n[EPOCH {epoch} EVAL] Val ScaleErr: {val_scale_err:.4f} | Val ShiftErr: {val_shift_err:.4f} | Val SSIM: {val_novel_ssim:.4f}")
+        print(f"                 Train ScaleErr: {train_scale_err:.4f} | Train ShiftErr: {train_shift_err:.4f} | Train SSIM: {train_novel_ssim:.4f}")
 
         train_vs_val_csv = os.path.join(args.checkpoint_dir, "train_vs_val_history.csv")
         tv_write_header = not os.path.exists(train_vs_val_csv)
@@ -683,7 +697,7 @@ def main():
                 f.write("epoch,train_mean_scale_err,train_mean_shift_err,val_mean_scale_err,val_mean_shift_err\n")
             f.write(f"{epoch},{train_scale_err:.6f},{train_shift_err:.6f},{val_scale_err:.6f},{val_shift_err:.6f}\n")
 
-        # Log ALL validation samples (no longer capping at [:10])
+        # Log ALL validation samples
         per_sample_csv = os.path.join(args.checkpoint_dir, "eval_per_sample_history.csv")
         ps_write_header = not os.path.exists(per_sample_csv)
         with open(per_sample_csv, "a") as f:
@@ -697,8 +711,8 @@ def main():
         eval_write_header = not os.path.exists(eval_csv)
         with open(eval_csv, "a") as f:
             if eval_write_header:
-                f.write("epoch,mean_scale_err,mean_shift_err,mean_attn_max\n")
-            f.write(f"{epoch},{val_scale_err:.6f},{val_shift_err:.6f},{mean_attn_max:.6f}\n")
+                f.write("epoch,mean_scale_err,mean_shift_err,mean_attn_max,mean_novel_ssim\n")
+            f.write(f"{epoch},{val_scale_err:.6f},{val_shift_err:.6f},{mean_attn_max:.6f},{val_novel_ssim:.6f}\n")
 
         val_err_history.append(val_scale_err)
         if len(val_err_history) >= 5:

@@ -1,4 +1,3 @@
-# cache_features_1400.py
 
 import os
 import sys
@@ -79,12 +78,16 @@ def main():
                 vggt_out = vggt.forward_with_features(gt_rgb_A)
                 mask_148_A = get_letter_mask(mesh_path, meta, device=device)
                 mask_148_B = get_letter_mask(mesh_path, meta["camera_B"], device=device)
-                
+                mask_148_C = get_letter_mask(mesh_path, meta["camera_C"], device=device)
+                mask_148_D = get_letter_mask(mesh_path, meta["camera_D"], device=device)
+
                 torch.save({
                     "patch_tokens": vggt_out["patch_tokens"].half().cpu(),
                     "base_depth": vggt_out["depth"].half().cpu(),
                     "mask_148_A": mask_148_A.half().cpu(),
-                    "mask_148_B": mask_148_B.half().cpu()
+                    "mask_148_B": mask_148_B.half().cpu(),
+                    "mask_148_C": mask_148_C.half().cpu(),
+                    "mask_148_D": mask_148_D.half().cpu()
                 }, tmp_path)
                 
                 os.replace(tmp_path, out_path)
