@@ -22,6 +22,7 @@ def main():
     parser = argparse.ArgumentParser(description="Stage 1: letter masks only")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory of samples")
     parser.add_argument("--device", type=str, default="cpu", help="cpu (default) or cuda")
+    parser.add_argument("--cache_dir", type=str, default=None, help="Write masks to <cache_dir>/<sample>/masks_148.pt instead of inside the sample folder")
     args = parser.parse_args()
     device = torch.device(args.device)
 
@@ -32,9 +33,11 @@ def main():
     done = skipped = errors = 0
     with torch.no_grad():
         for sample_dir in tqdm(sample_dirs, desc="Masks"):
-            out_path = os.path.join(sample_dir, "masks_148.pt")
+            out_dir = os.path.join(args.cache_dir, os.path.basename(sample_dir)) if args.cache_dir else sample_dir
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, "masks_148.pt")
             tmp_path = out_path + ".tmp"
-            if os.path.exists(out_path) or os.path.exists(os.path.join(sample_dir, "cached_features.pt")):
+            if os.path.exists(out_path) or os.path.exists(os.path.join(out_dir, "cached_features.pt")):
                 skipped += 1
                 continue
             try:

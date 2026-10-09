@@ -438,7 +438,13 @@ def load_image_tensor(path):
     return torch.from_numpy(arr.copy()).permute(2, 0, 1).unsqueeze(0)  # [1,3,518,518]
 
 
-def load_sample(sample_dir):
+def cache_file(sample_dir, cache_dir=None):
+    """cached_features.pt location: <cache_dir>/<sample_name>/ if --cache_dir is given, else inside the sample folder."""
+    base = os.path.join(cache_dir, os.path.basename(sample_dir)) if cache_dir else sample_dir
+    return os.path.join(base, "cached_features.pt")
+
+
+def load_sample(sample_dir, cache_dir=None):
     """Same tensors as TypoSplatDataset.__getitem__, minus the depth EXR / diagnostics CSV (not needed)."""
     with open(os.path.join(sample_dir, "metadata.json"), "r") as f:
         meta = json.load(f)
@@ -450,9 +456,9 @@ def load_sample(sample_dir):
             raise FileNotFoundError(f"No *view_{v}*.png in {sample_dir}")
         paths[v] = found[0]
 
-    cache_path = os.path.join(sample_dir, "cached_features.pt")
+    cache_path = cache_file(sample_dir, cache_dir)
     if not os.path.exists(cache_path):
-        raise FileNotFoundError(f"cached_features.pt missing in {sample_dir}")
+        raise FileNotFoundError(f"cached_features.pt missing: {cache_path}")
     cached = torch.load(cache_path, map_location="cpu", weights_only=True)
     for k in ("patch_tokens", "base_depth", "mask_148_A", "mask_148_B", "mask_148_C", "mask_148_D"):
         if k not in cached:
@@ -600,6 +606,7 @@ def main():
     parser = argparse.ArgumentParser(description="TypoSplat test-set inference (renders + PSNR/SSIM figures)")
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint_epoch_N.pt")
     parser.add_argument("--test_dir", required=True, help="Folder with the test sample folders")
+    parser.add_argument("--cache_dir", default=None, help="Folder holding <sample>/cached_features.pt (default: inside each sample folder)")
     parser.add_argument("--out_dir", required=True, help="Output folder (e.g. on Google Drive)")
     parser.add_argument("--weights", required=True, choices=["raw", "ema", "both"],
                         help="Which weights in the checkpoint to use. Use the one printed on the [FINAL] line of your training log; 'both' runs each into its own subfolder.")
@@ -623,7 +630,7 @@ def main():
     if not sample_dirs:
         print(f"ERROR: no sample folders (with metadata.json) in {args.test_dir}")
         sys.exit(1)
-    missing_cache = [d for d in sample_dirs if not os.path.exists(os.path.join(d, "cached_features.pt"))]
+    missing_cache = [d for d in sample_dirs if not os.path.exists(cache_file(d, args.cache_dir))]
     if missing_cache:
         print(f"ERROR: {len(missing_cache)} of {len(sample_dirs)} samples have no cached_features.pt (e.g. {missing_cache[0]}).")
         print("Run cache_features_1400.py on the test folder first (needs the repo, VGGT and each sample's mesh.ply).")
@@ -656,7 +663,7 @@ def main():
         if not todo:
             continue
         try:
-            data = move_to_device(load_sample(sd), device)
+            data = move_to_device(load_sample(sd, args.cache_dir), device)
             for tag in todo:
                 upsampler, decoder = models[tag]
                 renders, m = predict_and_score(data, upsampler, decoder, device)

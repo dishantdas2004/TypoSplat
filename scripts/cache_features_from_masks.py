@@ -24,6 +24,7 @@ from src.models.vggt_wrapper import VGGTWrapper
 def main():
     parser = argparse.ArgumentParser(description="Stage 2: VGGT features (+ masks from masks_148.pt)")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory of samples")
+    parser.add_argument("--cache_dir", type=str, default=None, help="Read masks from / write cached_features.pt to <cache_dir>/<sample>/ instead of the sample folder")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,14 +42,16 @@ def main():
     skipped = errors = 0
     with torch.no_grad():
         for sample_dir in tqdm(sample_dirs, desc="Caching Features"):
-            out_path = os.path.join(sample_dir, "cached_features.pt")
+            out_dir = os.path.join(args.cache_dir, os.path.basename(sample_dir)) if args.cache_dir else sample_dir
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, "cached_features.pt")
             tmp_path = out_path + ".tmp"
             if os.path.exists(out_path):
                 skipped += 1
                 continue
 
             view_A_paths = glob.glob(os.path.join(sample_dir, "*view_A*.png"))
-            masks_path = os.path.join(sample_dir, "masks_148.pt")
+            masks_path = os.path.join(out_dir, "masks_148.pt")
             if not view_A_paths or not os.path.exists(masks_path):
                 print(f"\n[SKIP] {sample_dir}: missing view_A png or masks_148.pt (run stage 1 first)")
                 errors += 1
